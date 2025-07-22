@@ -2,11 +2,13 @@
 import RPi.GPIO as GPIO
 import time
 
+
+
 # set GPIO numbering mode and define output pins
 GPIO.setmode(GPIO.BOARD)
-GPIO.setup(37, GPIO.OUT)
-GPIO.setup(38, GPIO.OUT)
-GPIO.setup(40, GPIO.OUT)
+GPIO.setup(37, GPIO.OUT) # Relay Channel 1 (CH1)
+GPIO.setup(38, GPIO.OUT) # Relay Channel 2 (CH2)
+GPIO.setup(40, GPIO.OUT) # Relay Channel 3 (CH3)
 
 # cycle those relays
 try:
