@@ -3,7 +3,7 @@ import RPi.GPIO as GPIO
 import time
 
 # set GPIO numbering mode and define output pins
-GPIO.setmode(GPIO.BCM)
+GPIO.setmode(GPIO.BCM) # Use BCM pin numbering
 GPIO.setup(20, GPIO.OUT)
 GPIO.setup(26, GPIO.OUT)
 GPIO.setup(21, GPIO.OUT)
