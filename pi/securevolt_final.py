@@ -171,12 +171,14 @@ class MQTTClient:
     def __init__(self):
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, Config.CLIENT_ID)
         self.connected = False
+        self.client.on_message = self.on_message  # Attach message handler
 
     def connect(self):
         try:
             self.client.connect(Config.MQTT_BROKER, Config.MQTT_PORT, keepalive=60)
             self.client.loop_start()
             self.connected = True
+            self.client.subscribe("sim7600/alarm/control")  # Subscribe to alarm control topic
             logger.info(f"Connected to MQTT broker at {Config.MQTT_BROKER}:{Config.MQTT_PORT}")
             return True
         except Exception as e:
@@ -195,9 +197,22 @@ class MQTTClient:
             logger.debug(f"Published to {topic}")
             return True
         except Exception as e:
-            logger.error(f"MQTT PUBLISH ERROR] {e}")
+            logger.error(f"[MQTT PUBLISH ERROR] {e}")
             self.connected = False
             return False
+
+    def on_message(self, client, userdata, message):
+        try:
+            payload = message.payload.decode()
+            logger.info(f"[MQTT COMMAND] Received on {message.topic}: {payload}")
+            if message.topic == "sim7600/alarm/control":
+                if payload.strip().lower() == "off":
+                    activate_alarm(False)
+                elif payload.strip().lower() == "on":
+                    activate_alarm(True)
+        except Exception as e:
+            logger.error(f"[MQTT MESSAGE ERROR] {e}")
+
 
 
 # ==================== SIM7600 CONTROLLER ====================
