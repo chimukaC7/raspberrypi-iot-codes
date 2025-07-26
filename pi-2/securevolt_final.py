@@ -21,7 +21,6 @@ try:
     HARDWARE_AVAILABLE = True
 except ImportError as e:
     HARDWARE_AVAILABLE = False
-    # Initialize logging first for error reporting
     logging.basicConfig(level=logging.WARNING)
     logger = logging.getLogger("SecureVolt")
     logger.warning(f"Hardware components not available: {e}")
@@ -47,59 +46,44 @@ log_file = os.path.join(log_dir, "securevolt.log")
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(
-            log_file,
-            maxBytes=5*1024*1024,  # 5MB
-            backupCount=3           # Keep 3 backup logs
-        )
-    ]
+    handlers=[logging.StreamHandler(sys.stdout), RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)]
 )
 logger = logging.getLogger("SecureVolt")
 
 # ===== Configuration =====
 class Config:
-    # Device Identity
     DEVICE_ID = "SecureVolt_Pi5"
     DEVICE_SERIAL = "b0dcdf97926b6c2e"
-    LOCATION_CODE = "UNZA_SUBSTATION"
-    
-    # Hardware Pins
+    LOCATION_CODE = "LEVY_SUBSTATION"
+
     ALARM_RELAY_PIN = 40
     BUZZER_PIN = 38
-    
-    # MQTT Configuration
+
     MQTT_BROKER = "10.16.1.17"
     MQTT_PORT = 1883
     MQTT_TOPICS = {
-        "status": "securevolt/status",
-        "alarm": "securevolt/alarm",
-        "sensor": "securevolt/sensor",
-        "image": "securevolt/image",
-        "command": "securevolt/command"
+        "status": "sim7600/status",
+        "alarm": "sim7600/alarm",
+        "sensor": "sim7600/sensor",
+        "image": "sim7600/image",
+        "command": "sim7600/command"
     }
-    
-    # Camera Configuration
+
     CAMERA_IP = "192.168.1.64"
     CAMERA_USER = "admin"
     CAMERA_PASS = "Securevolt1"
     CAMERA_TIMEOUT = 10
     SNAPSHOT_URL = f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
-    
-    # Motion Detection
-    MOTION_THRESHOLD = 10000
+
     MIN_CONTOUR_AREA = 1000
     CAPTURE_INTERVAL = 0.5
     SAVE_FOLDER = "/home/zesco/hikvision_captures"
     MAX_STORAGE_HOURS = 2
-    
-    # Alarm Settings
+
     ALARM_DURATION = 10
     ALARM_BUZZER_ENABLED = True
     ALARM_BUZZER_FREQ = 2000
 
-    # SIM7600 Configuration
     SERIAL_BAUDRATE = 115200
     COMMAND_DELAY = 0.1
 
@@ -141,22 +125,13 @@ class HardwareController:
         self.relay = None
         self.buzzer = None
         self.env_sensor = EnvironmentalSensor()
-        
         if HARDWARE_AVAILABLE:
             self._initialize_gpio()
 
     def _initialize_gpio(self):
         try:
-            self.relay = OutputDevice(
-                Config.ALARM_RELAY_PIN, 
-                active_high=True, 
-                initial_value=False
-            )
-            self.buzzer = PWMOutputDevice(
-                Config.BUZZER_PIN,
-                initial_value=0,
-                frequency=Config.ALARM_BUZZER_FREQ
-            )
+            self.relay = OutputDevice(Config.ALARM_RELAY_PIN, active_high=True, initial_value=False)
+            self.buzzer = PWMOutputDevice(Config.BUZZER_PIN, frequency=Config.ALARM_BUZZER_FREQ)
             logger.info("GPIO devices initialized successfully")
         except Exception as e:
             logger.error(f"GPIO initialization failed: {e}")
@@ -165,14 +140,12 @@ class HardwareController:
         if not HARDWARE_AVAILABLE:
             logger.info(f"Mock alarm {'ACTIVATED' if state else 'DEACTIVATED'}")
             return
-            
         try:
             self.relay.value = state
             if state and Config.ALARM_BUZZER_ENABLED:
-                self.buzzer.value = 0.5  # 50% duty cycle
-                time.sleep(0.1)  # Short beep
+                self.buzzer.value = 0.5
+                time.sleep(0.1)
                 self.buzzer.value = 0
-            
             self.alarm_active = state
             logger.info(f"Alarm {'ACTIVATED' if state else 'DEACTIVATED'}")
         except Exception as e:
@@ -181,10 +154,8 @@ class HardwareController:
     def cleanup(self):
         if HARDWARE_AVAILABLE:
             try:
-                if self.relay:
-                    self.relay.close()
-                if self.buzzer:
-                    self.buzzer.close()
+                if self.relay: self.relay.close()
+                if self.buzzer: self.buzzer.close()
                 logger.info("GPIO resources released")
             except Exception as e:
                 logger.error(f"GPIO cleanup error: {e}")
@@ -195,14 +166,12 @@ class SIM7600Controller:
         self.ser = None
         self.port = self._detect_port()
         self.last_command_time = time.time()
-        
         if not self.port:
             self._list_serial_ports()
             raise RuntimeError("Could not detect SIM7600 port")
-
         try:
             self.ser = serial.Serial(self.port, Config.SERIAL_BAUDRATE, timeout=1)
-            time.sleep(2)  # Allow time for initialization
+            time.sleep(2)
             logger.info(f"[SIM7600] Connected to {self.port}")
         except Exception as e:
             logger.error(f"[SIM7600] Connection failed: {e}")
@@ -215,447 +184,214 @@ class SIM7600Controller:
                 with serial.Serial(port, Config.SERIAL_BAUDRATE, timeout=1) as ser:
                     ser.write(b'AT\r\n')
                     time.sleep(0.5)
-                    response = ser.read(ser.in_waiting).decode(errors='ignore')
-                    if 'OK' in response:
+                    if 'OK' in ser.read(ser.in_waiting).decode(errors='ignore'):
                         logger.info(f"[SIM7600] Found on {port}")
                         return port
-            except (serial.SerialException, OSError):
+            except:
                 continue
         return None
 
     def _list_serial_ports(self):
         logger.info("Available serial ports:")
-        for port in sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')):
-            logger.info(f"  {port}")
+        for p in sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')):
+            logger.info(f"  {p}")
 
-    def send_at_command(self, command, expected="OK", timeout=5):
+    def send_at_command(self, cmd, expected="OK", timeout=5):
         time.sleep(max(0, Config.COMMAND_DELAY - (time.time() - self.last_command_time)))
-        self.ser.write((command + '\r\n').encode())
+        self.ser.write((cmd + '\r\n').encode())
         self.last_command_time = time.time()
-
-        response = ""
-        end_time = time.time() + timeout
-        while time.time() < end_time:
+        resp = ""
+        end = time.time() + timeout
+        while time.time() < end:
             if self.ser.in_waiting:
                 line = self.ser.readline().decode(errors='ignore').strip()
-                if line:
-                    response += line + "\n"
-                    if expected in line or "ERROR" in line:
-                        break
+                resp += line + "\n"
+                if expected in line or "ERROR" in line:
+                    break
             time.sleep(0.1)
-
-        if "ERROR" in response:
-            raise RuntimeError(f"AT command failed: {response.strip()}")
-        return response
+        if "ERROR" in resp:
+            raise RuntimeError(f"AT command failed: {resp.strip()}")
+        return resp
 
     def get_network_status(self):
-        response = self.send_at_command("AT+CREG?")
-        match = re.search(r'\+CREG: (\d,\d)', response)
-        status_codes = {
-            '0,1': 'Registered - home network',
-            '0,5': 'Registered - roaming',
-            '0,2': 'Searching',
-            '0,3': 'Denied',
-            '0,4': 'Unknown',
-        }
-        return status_codes.get(match.group(1), "Unknown")
+        r = self.send_at_command("AT+CREG?")
+        m = re.search(r'\+CREG: (\d,\d)', r)
+        return {
+            '0,1':'Registered - home network','0,5':'Registered - roaming',
+            '0,2':'Searching','0,3':'Denied','0,4':'Unknown'
+        }.get(m.group(1), "Unknown")
 
     def get_signal_quality(self):
-        response = self.send_at_command("AT+CSQ")
-        match = re.search(r'\+CSQ: (\d+),', response)
-        if not match:
-            return {"quality": "Unknown", "dbm": "N/A"}
+        r = self.send_at_command("AT+CSQ")
+        m = re.search(r'\+CSQ: (\d+),', r)
+        if not m or int(m.group(1))==99:
+            return {"quality":"Unknown","dbm":"N/A","rssi":None}
+        v=int(m.group(1));return{"quality":f"{(v/31)*100:.1f}%","dbm":f"{-113+2*v} dBm","rssi":v}
 
-        rssi = int(match.group(1))
-        if rssi == 99:
-            return {"quality": "Unknown", "dbm": "N/A"}
-
-        quality = (rssi / 31) * 100
-        dbm = -113 + (2 * rssi)
-        return {
-            "quality": f"{quality:.1f}%",
-            "dbm": f"{dbm} dBm",
-            "rssi": rssi
-        }
-
-    def get_gps_data(self, retries=3):
+    def get_gps_data(self,retries=3):
         for _ in range(retries):
             try:
-                response = self.send_at_command("AT+CGPSINFO", timeout=10)
-                match = re.search(r'\+CGPSINFO: ([^,]+),([NS]),([^,]+),([EW])', response)
-                if match:
-                    lat = self._convert_coordinate(match.group(1), match.group(2))
-                    lon = self._convert_coordinate(match.group(3), match.group(4))
-                    return {
-                        "latitude": lat,
-                        "longitude": lon,
-                        "status": "Fix acquired"
-                    }
-                time.sleep(5)
+                r=self.send_at_command("AT+CGPSINFO",timeout=10)
+                m=re.search(r'\+CGPSINFO: ([^,]+),([NS]),([^,]+),([EW])',r)
+                if m:
+                    def conv(raw,dir):d=float(raw[:2] if dir in 'NS' else raw[:3]);m=float(raw[2:] if dir in 'NS' else raw[3:]);d+=m/60;return- d if dir in 'SW' else d
+                    return{"latitude":conv(m.group(1),m.group(2)),"longitude":conv(m.group(3),m.group(4)),"status":"Fix acquired"}
             except Exception as e:
                 logger.error(f"[GPS ERROR] {e}")
-        return {"status": "No fix"}
-
-    def _convert_coordinate(self, raw, direction):
-        try:
-            if direction in ['N', 'S']:
-                degrees = float(raw[:2])
-                minutes = float(raw[2:])
-            else:
-                degrees = float(raw[:3])
-                minutes = float(raw[3:])
-            decimal = degrees + (minutes / 60)
-            return -decimal if direction in ['S', 'W'] else decimal
-        except (ValueError, TypeError):
-            return None
+            time.sleep(5)
+        return{"status":"No fix"}
 
     def close(self):
         if self.ser and self.ser.is_open:
-            self.ser.close()
-            logger.info("[SIM7600] Serial connection closed")
+            self.ser.close();logger.info("[SIM7600] Serial connection closed")
 
-# ===== MQTT Client =====
-class SecureVoltMQTT:
-    def __init__(self):
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, Config.DEVICE_ID)
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.connected = False
-
-    def _on_connect(self, client, userdata, flags, reason_code, properties):
-        if reason_code == 0:
-            self.connected = True
-            client.subscribe(Config.MQTT_TOPICS["command"])
-            logger.info("Connected to MQTT broker")
-        else:
-            logger.error(f"Connection failed with code {reason_code}")
-
-    def _on_message(self, client, userdata, message):
-        try:
-            payload = json.loads(message.payload.decode())
-            logger.info(f"Received command: {payload}")
-            
-            if message.topic == Config.MQTT_TOPICS["command"]:
-                if payload.get("command") == "activate_alarm":
-                    hardware.activate_alarm(True)
-                elif payload.get("command") == "deactivate_alarm":
-                    hardware.activate_alarm(False)
-        except Exception as e:
-            logger.error(f"Command processing error: {e}")
-
-    def connect(self):
-        try:
-            self.client.connect(Config.MQTT_BROKER, Config.MQTT_PORT, 60)
-            self.client.loop_start()
-            return True
-        except Exception as e:
-            logger.error(f"MQTT connection error: {e}")
-            return False
-
-    def publish_status(self, status_data):
-        payload = {
-            "timestamp": datetime.now().isoformat(),
-            "device_id": Config.DEVICE_ID,
-            "status": status_data
-        }
-        self.client.publish(
-            Config.MQTT_TOPICS["status"],
-            json.dumps(payload),
-            qos=1
-        )
-
-    def publish_alarm_event(self, alarm_state, reason=""):
-        payload = {
-            "timestamp": datetime.now().isoformat(),
-            "device_id": Config.DEVICE_ID,
-            "state": alarm_state,
-            "reason": reason
-        }
-        self.client.publish(
-            Config.MQTT_TOPICS["alarm"],
-            json.dumps(payload),
-            qos=1,
-            retain=True
-        )
-
-    def publish_sensor_data(self, modem_data, env_data, alarm_status, motion_status):
-        payload = {
-            "modem": modem_data,
-            "timestamp": datetime.now().isoformat(),
-            "device_info": {
-                "serial": Config.DEVICE_SERIAL,
-                "location_code": Config.LOCATION_CODE
-            },
-            "alarm_status": alarm_status,
-            "environment": env_data,
-            "motion_status": motion_status
-        }
-        self.client.publish(
-            Config.MQTT_TOPICS["sensor"],
-            json.dumps(payload),
-            qos=0
-        )
-
-    def publish_image_alert(self, image_path, metadata):
-        try:
-            with open(image_path, "rb") as f:
-                image_data = f.read()
-            
-            payload = {
-                "timestamp": datetime.now().isoformat(),
-                "device_id": Config.DEVICE_ID,
-                "image": image_data.hex(),
-                "metadata": metadata
-            }
-            self.client.publish(
-                Config.MQTT_TOPICS["image"],
-                json.dumps(payload),
-                qos=1
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Image publish error: {e}")
-            return False
-
-    def cleanup(self):
-        self.client.loop_stop()
-        self.client.disconnect()
-        logger.info("MQTT client shutdown")
-
-# ===== Motion Detection =====
+# ===== Motion Detector =====
 class MotionDetector:
     def __init__(self):
-        self.previous_frame = None
-        self.motion_detected = False
-        self.motion_counter = 0
-        self.last_motion_time = 0
-        self.last_capture_time = 0
-        self.last_cleanup = time.time()
-        self.auth = HTTPDigestAuth(Config.CAMERA_USER, Config.CAMERA_PASS)
-        self.event_queue = Queue()
-        os.makedirs(Config.SAVE_FOLDER, exist_ok=True)
+        self.previous_frame=None;self.motion_detected=False;self.motion_counter=0
+        self.last_motion_time=0;self.last_cleanup=time.time()
+        self.auth=HTTPDigestAuth(Config.CAMERA_USER,Config.CAMERA_PASS)
+        self.event_queue=Queue()
+        os.makedirs(Config.SAVE_FOLDER,exist_ok=True)
 
     def get_camera_snapshot(self):
         try:
-            response = requests.get(
-                Config.SNAPSHOT_URL,
-                auth=self.auth,
-                stream=True,
-                timeout=Config.CAMERA_TIMEOUT,
-                verify=False
-            )
-            if response.status_code == 200:
-                image_data = bytes()
-                for chunk in response.iter_content(1024):
-                    image_data += chunk
-                return cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
-            logger.error(f"Camera error: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Camera error: {e}")
+            r=requests.get(Config.SNAPSHOT_URL,auth=self.auth,timeout=Config.CAMERA_TIMEOUT,verify=False)
+            if r.status_code==200:
+                data=bytes()
+                for c in r.iter_content(1024):data+=c
+                return cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
+        except Exception as e:logger.error(f"Camera error: {e}")
         return None
 
-    def detect_motion(self, frame):
-        if frame is None:
-            return False, 0
+    def detect_motion(self,frame):
+        if frame is None:return False,0
+        g=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY);g=cv2.GaussianBlur(g,(21,21),0)
+        if self.previous_frame is None:self.previous_frame=g;return False,0
+        d=cv2.absdiff(self.previous_frame,g)
+        t=cv2.threshold(d,25,255,cv2.THRESH_BINARY)[1]
+        t=cv2.dilate(t,None,iterations=2)
+        cnts,_=cv2.findContours(t.copy(),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        m=False;max_area=0
+        for c in cnts:
+            a=cv2.contourArea(c)
+            if a>Config.MIN_CONTOUR_AREA:m=True;max_area=max(max_area,a)
+        self.previous_frame=g;return m,max_area
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-        if self.previous_frame is None:
-            self.previous_frame = gray
-            return False, 0
-
-        frame_delta = cv2.absdiff(self.previous_frame, gray)
-        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        
-        contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        motion_found = False
-        max_area = 0
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > Config.MIN_CONTOUR_AREA:
-                motion_found = True
-                if area > max_area:
-                    max_area = area
-
-        self.previous_frame = gray
-        return motion_found, max_area
-
-    def save_image(self, frame):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{timestamp}.jpg"
-        path = os.path.join(Config.SAVE_FOLDER, filename)
-        
-        try:
-            cv2.imwrite(path, frame)
-            return path
-        except Exception as e:
-            logger.error(f"Error saving image: {e}")
-            return None
+    def save_image(self,frame):
+        ts=datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn=f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
+        p=os.path.join(Config.SAVE_FOLDER,fn)
+        try:cv2.imwrite(p,frame);return p
+        except Exception as e:logger.error(f"Error saving image: {e}");return None
 
     def run_detection(self):
-        logger.info("Starting motion detection system")
-        
+        logger.info("Starting motion detection")
         while True:
-            start_time = time.time()
-
-            # Cleanup old files periodically
-            if time.time() - self.last_cleanup > 1800:  # Every 30 minutes
-                self._cleanup_old_files()
-                self.last_cleanup = time.time()
-
-            # Get current frame
-            frame = self.get_camera_snapshot()
-            if frame is None:
-                time.sleep(1)
-                continue
-
-            # Detect motion and get object size
-            current_motion, area = self.detect_motion(frame)
-
-            if current_motion:
-                self.motion_counter += 1
-                self.last_motion_time = time.time()
-
-                # Initial motion detection
-                if not self.motion_detected and self.motion_counter >= 3:
-                    self.motion_detected = True
-                    hardware.activate_alarm(True)
-                    image_path = self.save_image(frame)
-                    if image_path:
-                        metadata = {
-                            "location": Config.LOCATION_CODE,
-                            "reason": "motion_detected",
-                            "area": area
-                        }
-                        mqtt_client.publish_image_alert(image_path, metadata)
+            if time.time()-self.last_cleanup>1800: self._cleanup_old_files();self.last_cleanup=time.time()
+            f=self.get_camera_snapshot()
+            cur,area=self.detect_motion(f)
+            if cur:
+                self.motion_counter+=1;self.last_motion_time=time.time()
+                if not self.motion_detected and self.motion_counter>=3:
+                    self.motion_detected=True;hardware.activate_alarm(True)
+                    ipath=self.save_image(f)
+                    if ipath:
+                        md={"location":Config.LOCATION_CODE,"reason":"motion_detected","area":area}
+                        mqtt_client.publish_image_alert(ipath,md)
             else:
-                self.motion_counter = 0
-
-                # Motion ended
-                if self.motion_detected and (time.time() - self.last_motion_time > Config.ALARM_DURATION):
-                    self.motion_detected = False
-                    hardware.activate_alarm(False)
-
-            # Maintain processing rate
-            processing_time = time.time() - start_time
-            sleep_time = max(0, Config.CAPTURE_INTERVAL - processing_time)
-            time.sleep(sleep_time)
+                self.motion_counter=0
+                if self.motion_detected and time.time()-self.last_motion_time>Config.ALARM_DURATION:
+                    self.motion_detected=False;hardware.activate_alarm(False)
+            t=time.time()-self.last_cleanup;time.sleep(max(0,Config.CAPTURE_INTERVAL-t))
 
     def _cleanup_old_files(self):
-        now = time.time()
-        cutoff = now - (Config.MAX_STORAGE_HOURS * 3600)
-
-        try:
-            for filename in os.listdir(Config.SAVE_FOLDER):
-                filepath = os.path.join(Config.SAVE_FOLDER, filename)
-                if os.path.isfile(filepath):
-                    file_time = os.path.getmtime(filepath)
-                    if file_time < cutoff:
-                        os.remove(filepath)
-                        logger.info(f"Removed old file: {filename}")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+        now=time.time();cut=now-Config.MAX_STORAGE_HOURS*3600
+        for fn in os.listdir(Config.SAVE_FOLDER):
+            p=os.path.join(Config.SAVE_FOLDER,fn)
+            if os.path.isfile(p) and os.path.getmtime(p)<cut:os.remove(p);logger.info(f"Removed old file: {fn}")
 
 # ===== File Uploader =====
 class FileUploader:
     def __init__(self):
-        self.ssh = None
-        self.sftp = None
-        self._connect()
-
+        self.ssh=None;self.sftp=None;self._connect()
     def _connect(self):
         try:
-            self.ssh = paramiko.SSHClient()
-            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(
-                Config.MQTT_BROKER,  # Using same host as MQTT broker
-                port=22,
-                username="root",
-                password="root123",
-                timeout=10
-            )
-            self.sftp = self.ssh.open_sftp()
-            logger.info("SFTP connection established")
-        except Exception as e:
-            logger.error(f"SFTP connection failed: {e}")
-
-    def upload_image(self, image_path, remote_path):
-        if not self.sftp:
-            self._connect()
-            if not self.sftp:
-                return False
-
+            self.ssh=paramiko.SSHClient();self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(Config.MQTT_BROKER,port=22,username="root",password="root123",timeout=10)
+            self.sftp=self.ssh.open_sftp();logger.info("SFTP connected")
+        except Exception as e:logger.error(f"SFTP failed: {e}")
+    def upload_image(self,src,dst):
         try:
-            self.sftp.put(image_path, remote_path)
-            logger.info(f"Uploaded {image_path} to {remote_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
-            return False
-
+            if not self.sftp:self._connect()
+            self.sftp.put(src,dst);logger.info(f"Uploaded {src} to {dst}");return True
+        except Exception as e:logger.error(f"Upload failed: {e}");return False
     def close(self):
-        if self.sftp:
-            self.sftp.close()
-        if self.ssh:
-            self.ssh.close()
+        if self.sftp:self.sftp.close()
+        if self.ssh:self.ssh.close()
 
-# ===== Main Application =====
+# ===== MQTT Client =====
+class SecureVoltMQTT:
+    def __init__(self,hardware_controller):
+        self.hardware=hardware_controller
+        self.client=mqtt.Client(client_id=Config.DEVICE_ID)
+        self.client.on_connect=self._on_connect;self.client.on_message=self._on_message
+        self.connected=False
+
+    def _on_connect(self,client,user,flags,reason):
+        if reason==0:client.subscribe(Config.MQTT_TOPICS["command"]);self.connected=True;logger.info("MQTT connected")
+        else:logger.error(f"MQTT connect failed: {reason}")
+    def _on_message(self,client,user,msg):
+        try:
+            p=json.loads(msg.payload.decode());cmd=p.get("command")
+            if cmd=="activate_alarm":self.hardware.activate_alarm(True)
+            elif cmd=="deactivate_alarm":self.hardware.activate_alarm(False)
+        except Exception as e:logger.error(f"MQTT msg error: {e}")
+
+    def connect(self):
+        try:self.client.connect(Config.MQTT_BROKER,Config.MQTT_PORT,60);self.client.loop_start();return True
+        except Exception as e:logger.error(f"MQTT err: {e}");return False
+
+    def publish_status(self,data):self.client.publish(Config.MQTT_TOPICS["sensor"],json.dumps({"timestamp":datetime.now().isoformat(),"device_id":Config.DEVICE_ID,"status":data}),qos=1)
+    def publish_alarm_event(self,s,r=""):self.client.publish(Config.MQTT_TOPICS["alarm"],json.dumps({"timestamp":datetime.now().isoformat(),"device_id":Config.DEVICE_ID,"state":s,"reason":r}),qos=1,retain=True)
+    def publish_sensor_data(self,md,ed,as_,ms):self.client.publish(Config.MQTT_TOPICS["status"],json.dumps({"modem":md,"timestamp":datetime.now().isoformat(),"device_info":{"serial":Config.DEVICE_SERIAL,"location_code":Config.LOCATION_CODE},"alarm_status":as_,"environment":ed,"motion_status":ms}),qos=0)
+    def publish_image_alert(self,p,md):
+        try:
+            d=open(p,"rb").read();self.client.publish(Config.MQTT_TOPICS["image"],json.dumps({"timestamp":datetime.now().isoformat(),"device_id":Config.DEVICE_ID,"image":d.hex(),"metadata":md}),qos=1);return True
+        except Exception as e:logger.error(f"MQTT img err: {e}");return False
+    def cleanup(self):self.client.loop_stop();self.client.disconnect();logger.info("MQTT shutdown")
+
+# ===== Main App =====
 class SecureVoltApp:
-    def  __init__(self):
-        self.hardware = HardwareController()
-        self.modem = SIM7600Controller()
-        self.mqtt = SecureVoltMQTT()
-        self.detector = MotionDetector()
-        self.uploader = FileUploader()
-        self.running = False
+    def __init__(self):
+        self.hardware=HardwareController()
+        self.modem=SIM7600Controller()
+        self.mqtt=SecureVoltMQTT(self.hardware)
+        self.detector=MotionDetector()
+        self.uploader=FileUploader()
+        self.running=False
 
     def run(self):
-        self.running = True
-        
-        # Initialize connections
-        if not self.mqtt.connect():
-            logger.error("Failed to connect to MQTT broker")
-            return
-
-        # Start motion detection in separate thread
-        detection_thread = threading.Thread(
-            target=self.detector.run_detection,
-            daemon=True
-        )
-        detection_thread.start()
-
-        # Main system monitoring loop
+        self.running=True
+        if not self.mqtt.connect():logger.error("MQTT connect fail");return
+        threading.Thread(target=self.detector.run_detection,daemon=True).start()
         try:
             while self.running:
-                # Publish system status periodically
-                status = {
-                    "alarm_active": self.hardware.alarm_active,
-                    "motion_detected": self.detector.motion_detected,
-                    "modem": {
-                        "network": self.modem.get_network_status(),
-                        "signal": self.modem.get_signal_quality(),
-                        "gps": self.modem.get_gps_data()
-                    }
-                }
-                
-                env_data = self.hardware.env_sensor.read()
-                if env_data and env_data.get("status") == "OK":
-                    status["environment"] = env_data
-                    self.mqtt.publish_sensor_data(env_data)
-                
+                status={"alarm_active":self.hardware.alarm_active,"motion_detected":self.detector.motion_detected}
+                env=self.hardware.env_sensor.read()
+                if env.get("status")=="OK":
+                    md={"network":self.modem.get_network_status(),"signal":self.modem.get_signal_quality(),"gps":self.modem.get_gps_data()}
+                    ms={"active":self.detector.motion_detected,"last_update":time.time(),"alarm_active":self.hardware.alarm_active,"current_alarm_interval":Config.ALARM_DURATION}
+                    self.mqtt.publish_sensor_data(md,env,self.hardware.alarm_active,ms)
                 self.mqtt.publish_status(status)
                 time.sleep(30)
-                
         except KeyboardInterrupt:
-            logger.info("Shutting down...")
+            logger.info("Shutdown requested")
         finally:
             self.shutdown()
 
     def shutdown(self):
-        self.running = False
+        self.running=False
         self.hardware.activate_alarm(False)
         self.hardware.cleanup()
         self.modem.close()
@@ -663,25 +399,6 @@ class SecureVoltApp:
         self.uploader.close()
         logger.info("SecureVolt shutdown complete")
 
-# ===== Initialization and Startup =====
 if __name__ == "__main__":
-    # Create log directory if not exists
-    log_dir = os.path.join(os.path.expanduser("~"), "securevolt_logs")
-    os.makedirs(log_dir, exist_ok=True)
-
-    # Verify hardware components
-    try:
-        test_sensor = EnvironmentalSensor()
-        if test_sensor.sensor:
-            print("BME280 Sensor Test:")
-            print(f"Temperature: {test_sensor.sensor.temperature:.1f}°C")
-            print(f"Humidity: {test_sensor.sensor.humidity:.1f}%")
-            print(f"Pressure: {test_sensor.sensor.pressure:.1f}hPa")
-        else:
-            print("BME280 not available, running without environmental data")
-    except Exception as e:
-        print(f"Hardware test failed: {e}")
-
-    # Run main application
-    app = SecureVoltApp()
+    app=SecureVoltApp()
     app.run()
