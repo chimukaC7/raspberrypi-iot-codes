@@ -205,7 +205,7 @@ class MQTTClient:
         try:
             payload = message.payload.decode()
             logger.info(f"[MQTT COMMAND] Received on {message.topic}: {payload}")
-            if message.topic == "sim7600/alarm/control":
+            if message.topic == "sim7600/" + Config.CLIENT_ID + "/alarm/control":
                 if payload.strip().lower() == "off":
                     activate_alarm(False)
                 elif payload.strip().lower() == "on":
