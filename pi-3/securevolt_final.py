@@ -11,7 +11,6 @@ from datetime import datetime
 import threading
 from queue import Queue
 
-# ===== Hardware Imports with Error Handling =====
 try:
     import lgpio
     from gpiozero import OutputDevice, PWMOutputDevice
@@ -25,20 +24,14 @@ except ImportError as e:
     logger = logging.getLogger("SecureVolt")
     logger.warning(f"Hardware components not available: {e}")
 
-# ===== Network Imports =====
 import paho.mqtt.client as mqtt
 import requests
 from requests.auth import HTTPDigestAuth
 import paramiko
-
-# ===== Image Processing =====
 import cv2
 import numpy as np
-
-# ===== Serial Communication =====
 import serial
 
-# ===== Logging Setup =====
 log_dir = os.path.join(os.path.expanduser("~"), "securevolt_logs")
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "securevolt.log")
@@ -73,7 +66,7 @@ class Config:
     CAMERA_USER = "admin"
     CAMERA_PASS = "Securevolt1"
     CAMERA_TIMEOUT = 10
-    SNAPSHOT_URL = f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
+    # SNAPSHOT_URL removed; only RTSP used now
 
     MIN_CONTOUR_AREA = 1000
     CAPTURE_INTERVAL = 0.5
@@ -87,10 +80,16 @@ class Config:
     SERIAL_BAUDRATE = 115200
     COMMAND_DELAY = 0.1
 
-    # RTSP Stream Configuration
     RTSP_URL = "rtsp://securevolt1:Securevolt1@10.42.0.132:554/stream1"
     RTSP_MIN_CONTOUR_AREA = MIN_CONTOUR_AREA
     RTSP_MOTION_COOLDOWN = 3
+
+    # SFTP server configuration
+    SFTP_HOST = MQTT_BROKER  # Change if needed
+    SFTP_PORT = 22
+    SFTP_USER = "root"
+    SFTP_PASS = "root123"
+    SFTP_UPLOAD_PATH = "/var/www/html/AntiVandalismSensorSystem/public/videos/"  # Folder on SFTP server
 
 # ===== Environmental Sensor =====
 class EnvironmentalSensor:
@@ -254,143 +253,6 @@ class SIM7600Controller:
         if self.ser and self.ser.is_open:
             self.ser.close(); logger.info("[SIM7600] Serial connection closed")
 
-# ===== Motion Detector (HTTP Snapshot) =====
-class MotionDetector:
-    def __init__(self):
-        self.previous_frame = None
-        self.motion_detected = False
-        self.motion_counter = 0
-        self.last_motion_time = 0
-        self.last_cleanup = time.time()
-        self.auth = HTTPDigestAuth(Config.CAMERA_USER, Config.CAMERA_PASS)
-        self.event_queue = Queue()
-        os.makedirs(Config.SAVE_FOLDER, exist_ok=True)
-
-    def get_camera_snapshot(self):
-        try:
-            r = requests.get(Config.SNAPSHOT_URL, auth=self.auth, timeout=Config.CAMERA_TIMEOUT, verify=False)
-            if r.status_code == 200:
-                data = bytes()
-                for c in r.iter_content(1024): data += c
-                return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        except Exception as e:
-            logger.error(f"Camera error: {e}")
-        return None
-
-    def detect_motion(self, frame):
-        if frame is None: return False, 0
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (21, 21), 0)
-        if self.previous_frame is None:
-            self.previous_frame = blurred
-            return False, 0
-        diff = cv2.absdiff(self.previous_frame, blurred)
-        thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)[1]
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        motion = False
-        max_area = 0
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if area > Config.MIN_CONTOUR_AREA:
-                motion = True
-                max_area = max(max_area, area)
-        self.previous_frame = blurred
-        return motion, max_area
-
-    def save_image(self, frame):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fn = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
-        p = os.path.join(Config.SAVE_FOLDER, fn)
-        try:
-            cv2.imwrite(p, frame)
-            return p
-        except Exception as e:
-            logger.error(f"Error saving image: {e}")
-            return None
-
-    def _cleanup_old_files(self):
-        cutoff = time.time() - Config.MAX_STORAGE_HOURS * 3600
-        for fn in os.listdir(Config.SAVE_FOLDER):
-            p = os.path.join(Config.SAVE_FOLDER, fn)
-            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
-                os.remove(p)
-                logger.info(f"Removed old file: {fn}")
-
-    def run_detection(self):
-        logger.info("Starting HTTP-based motion detection")
-        while True:
-            if time.time() - self.last_cleanup > 1800:
-                self._cleanup_old_files()
-                self.last_cleanup = time.time()
-            frame = self.get_camera_snapshot()
-            motion, area = self.detect_motion(frame)
-            if motion:
-                self.motion_counter += 1
-                self.last_motion_time = time.time()
-                if not self.motion_detected and self.motion_counter >= 3:
-                    self.motion_detected = True
-                    hardware.activate_alarm(True)
-                    img_path = self.save_image(frame)
-                    if img_path:
-                        metadata = {"location": Config.LOCATION_CODE, "reason": "motion_detected", "area": area}
-                        mqtt_client.publish_image_alert(img_path, metadata)
-            else:
-                self.motion_counter = 0
-                if self.motion_detected and time.time() - self.last_motion_time > Config.ALARM_DURATION:
-                    self.motion_detected = False
-                    hardware.activate_alarm(False)
-            time.sleep(Config.CAPTURE_INTERVAL)
-
-# ===== RTSP Motion Detector =====
-class RTSPMotionDetector:
-    def __init__(self, rtsp_url, save_folder, min_contour_area, motion_cooldown):
-        self.rtsp_url = rtsp_url
-        self.save_folder = save_folder
-        self.min_contour_area = min_contour_area
-        self.motion_cooldown = motion_cooldown
-        os.makedirs(self.save_folder, exist_ok=True)
-
-    def run(self):
-        logger.info(f"Starting RTSP motion detection on {self.rtsp_url}")
-        cap = cv2.VideoCapture(self.rtsp_url)
-        if not cap.isOpened():
-            logger.error(f"Failed to connect to RTSP stream: {self.rtsp_url}")
-            return
-        ret, frame1 = cap.read()
-        ret, frame2 = cap.read()
-        last_capture = 0
-        while cap.isOpened():
-            diff = cv2.absdiff(frame1, frame2)
-            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, thresh = cv2.threshold(blur, 20, 255, cv2.THRESH_BINARY)
-            dilated = cv2.dilate(thresh, None, iterations=3)
-            contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            motion = False
-            for cnt in contours:
-                if cv2.contourArea(cnt) < self.min_contour_area:
-                    continue
-                x, y, w, h = cv2.boundingRect(cnt)
-                cv2.rectangle(frame1, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                motion = True
-            if motion and (time.time() - last_capture > self.motion_cooldown):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filepath = os.path.join(self.save_folder, f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg")
-                cv2.imwrite(filepath, frame1)
-                logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
-                last_capture = time.time()
-
-
-
-            frame1 = frame2
-            ret, frame2 = cap.read()
-            if not ret:
-                logger.error("Failed to grab RTSP frame")
-                break
-            time.sleep(0.01)
-        cap.release()
-
 # ===== File Uploader =====
 class FileUploader:
     def __init__(self):
@@ -401,11 +263,13 @@ class FileUploader:
         try:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(Config.MQTT_BROKER, port=22, username="root", password="root123", timeout=10)
+            self.ssh.connect(Config.SFTP_HOST, port=Config.SFTP_PORT, username=Config.SFTP_USER, password=Config.SFTP_PASS, timeout=10)
             self.sftp = self.ssh.open_sftp()
             logger.info("SFTP connected")
         except Exception as e:
             logger.error(f"SFTP failed: {e}")
+            self.ssh = None
+            self.sftp = None
     def upload_image(self, src, dst):
         try:
             if not self.sftp:
@@ -431,7 +295,7 @@ class SecureVoltMQTT:
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            client.subscribe(Config.MQTT_TOPICS["command"] )
+            client.subscribe(Config.MQTT_TOPICS["command"])
             self.connected = True
             logger.info("MQTT connected")
         else:
@@ -462,10 +326,15 @@ class SecureVoltMQTT:
     def publish_sensor_data(self, net, env, alarm, motion):
         msg = {"modem": net, "timestamp": datetime.now().isoformat(), "device_info": {"serial": Config.DEVICE_SERIAL, "location_code": Config.LOCATION_CODE}, "alarm_status": alarm, "environment": env, "motion_status": motion}
         self.client.publish(Config.MQTT_TOPICS["status"], json.dumps(msg), qos=0)
-    def publish_image_alert(self, path, metadata):
+    def publish_image_alert(self, sftp_path, metadata):
         try:
-            data = open(path, "rb").read()
-            self.client.publish(Config.MQTT_TOPICS["image"], json.dumps({"timestamp": datetime.now().isoformat(), "device_id": Config.DEVICE_ID, "image": data.hex(), "metadata": metadata}), qos=1)
+            # sftp_path is server file path; just publish metadata
+            self.client.publish(Config.MQTT_TOPICS["image"], json.dumps({
+                "timestamp": datetime.now().isoformat(),
+                "device_id": Config.DEVICE_ID,
+                "file_path": sftp_path,
+                "metadata": metadata
+            }), qos=1)
             return True
         except Exception as e:
             logger.error(f"MQTT img err: {e}")
@@ -475,6 +344,91 @@ class SecureVoltMQTT:
         self.client.disconnect()
         logger.info("MQTT shutdown")
 
+# ===== RTSP Motion Detector (includes upload + MQTT) =====
+class RTSPMotionDetector:
+    def __init__(self, rtsp_url, save_folder, min_contour_area, motion_cooldown, uploader, mqtt_client, hardware):
+        self.rtsp_url = rtsp_url
+        self.save_folder = save_folder
+        self.min_contour_area = min_contour_area
+        self.motion_cooldown = motion_cooldown
+        self.uploader = uploader
+        self.mqtt_client = mqtt_client
+        self.hardware = hardware
+        os.makedirs(self.save_folder, exist_ok=True)
+
+    def _cleanup_old_files(self):
+        cutoff = time.time() - Config.MAX_STORAGE_HOURS * 3600
+        for fn in os.listdir(self.save_folder):
+            p = os.path.join(self.save_folder, fn)
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                logger.info(f"Removed old file: {fn}")
+
+    def run(self):
+        logger.info(f"Starting RTSP motion detection on {self.rtsp_url}")
+        cap = cv2.VideoCapture(self.rtsp_url)
+        if not cap.isOpened():
+            logger.error(f"Failed to connect to RTSP stream: {self.rtsp_url}")
+            return
+        ret, frame1 = cap.read()
+        ret, frame2 = cap.read()
+        last_capture = 0
+        last_cleanup = time.time()
+        while cap.isOpened():
+            if time.time() - last_cleanup > 1800:
+                self._cleanup_old_files()
+                last_cleanup = time.time()
+            diff = cv2.absdiff(frame1, frame2)
+            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, thresh = cv2.threshold(blur, 20, 255, cv2.THRESH_BINARY)
+            dilated = cv2.dilate(thresh, None, iterations=3)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            motion = False
+            max_area = 0
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < self.min_contour_area:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                cv2.rectangle(frame1, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                motion = True
+                max_area = max(max_area, area)
+            if motion and (time.time() - last_capture > self.motion_cooldown):
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
+                filepath = os.path.join(self.save_folder, filename)
+                cv2.imwrite(filepath, frame1)
+                logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
+                # Trigger alarm
+                self.hardware.activate_alarm(True)
+                # Upload
+                sftp_dst = os.path.join(Config.SFTP_UPLOAD_PATH, filename)
+                uploaded = self.uploader.upload_image(filepath, sftp_dst)
+                if uploaded:
+                    metadata = {
+                        "location": Config.LOCATION_CODE,
+                        "reason": "motion_detected",
+                        "area": max_area,
+                        "local_file": filepath,
+                        "sftp_path": sftp_dst
+                    }
+                    self.mqtt_client.publish_image_alert(sftp_dst, metadata)
+                else:
+                    logger.error(f"Failed to upload {filepath}")
+                last_capture = time.time()
+            else:
+                # Optionally deactivate alarm if no recent motion
+                if self.hardware.alarm_active and (time.time() - last_capture > Config.ALARM_DURATION):
+                    self.hardware.activate_alarm(False)
+            frame1 = frame2
+            ret, frame2 = cap.read()
+            if not ret:
+                logger.error("Failed to grab RTSP frame")
+                break
+            time.sleep(0.01)
+        cap.release()
+
 # ===== Main App =====
 class SecureVoltApp:
     def __init__(self):
@@ -482,9 +436,12 @@ class SecureVoltApp:
         hardware = HardwareController()
         self.modem = SIM7600Controller()
         mqtt_client = SecureVoltMQTT(hardware)
-        self.detector = MotionDetector()
-        self.rtsp_detector = RTSPMotionDetector(Config.RTSP_URL, Config.SAVE_FOLDER, Config.RTSP_MIN_CONTOUR_AREA, Config.RTSP_MOTION_COOLDOWN)
         self.uploader = FileUploader()
+        self.rtsp_detector = RTSPMotionDetector(
+            Config.RTSP_URL, Config.SAVE_FOLDER,
+            Config.RTSP_MIN_CONTOUR_AREA, Config.RTSP_MOTION_COOLDOWN,
+            self.uploader, mqtt_client, hardware
+        )
         self.running = False
 
     def run(self):
@@ -492,11 +449,10 @@ class SecureVoltApp:
         if not mqtt_client.connect():
             logger.error("MQTT connect fail")
             return
-        threading.Thread(target=self.detector.run_detection, daemon=True).start()
         threading.Thread(target=self.rtsp_detector.run, daemon=True).start()
         try:
             while self.running:
-                status = {"alarm_active": hardware.alarm_active, "motion_detected": self.detector.motion_detected}
+                status = {"alarm_active": hardware.alarm_active}
                 env = hardware.env_sensor.read()
                 if env.get("status") == "OK":
                     net = {
@@ -504,7 +460,7 @@ class SecureVoltApp:
                         "signal": self.modem.get_signal_quality(),
                         "gps": self.modem.get_gps_data()
                     }
-                    ms = {"active": self.detector.motion_detected, "alarm_active": hardware.alarm_active, "interval": Config.ALARM_DURATION}
+                    ms = {"alarm_active": hardware.alarm_active}
                     mqtt_client.publish_sensor_data(net, env, hardware.alarm_active, ms)
                 mqtt_client.publish_status(status)
                 time.sleep(30)
