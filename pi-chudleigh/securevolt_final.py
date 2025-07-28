@@ -124,45 +124,70 @@ class EnvironmentalSensor:
 
 # ===== Hardware Controller =====
 class HardwareController:
+    # BCM pin mapping for relays and buzzer
+    RELAY_CH3 = 21  # For alarm (BOARD 40)
+    RELAY_CH2 = 20  # (BOARD 38)
+    RELAY_CH1 = 26  # (BOARD 37)
+    BUZZER_PIN = 19  # Example: change as needed!
+
     def __init__(self):
         self.alarm_active = False
-        self.relay = None
-        self.buzzer = None
+        self.lgpio_handle = None
         self.env_sensor = EnvironmentalSensor()
-        if HARDWARE_AVAILABLE:
-            self._initialize_gpio()
+        self._init_lgpio()
 
-    def _initialize_gpio(self):
+    def _init_lgpio(self):
         try:
-            self.relay = OutputDevice(Config.ALARM_RELAY_PIN, active_high=True, initial_value=False)
-            self.buzzer = PWMOutputDevice(Config.BUZZER_PIN, frequency=Config.ALARM_BUZZER_FREQ)
-            logger.info("GPIO devices initialized successfully")
+            # Open a handle to /dev/gpiochip0
+            self.lgpio_handle = lgpio.gpiochip_open(0)
+            # Set relays and buzzer as outputs, initially off
+            for pin in [self.RELAY_CH3, self.RELAY_CH2, self.RELAY_CH1]:
+                lgpio.gpio_claim_output(self.lgpio_handle, pin, 0)
+            # If using a buzzer on another pin, claim it as output too:
+            # lgpio.gpio_claim_output(self.lgpio_handle, self.BUZZER_PIN, 0)
+            logger.info("lgpio: GPIOs claimed for relays (and buzzer if used)")
         except Exception as e:
-            logger.error(f"GPIO initialization failed: {e}")
+            logger.error(f"lgpio init failed: {e}")
 
     def activate_alarm(self, state=True):
-        if not HARDWARE_AVAILABLE:
-            logger.info(f"Mock alarm {'ACTIVATED' if state else 'DEACTIVATED'}")
-            return
-        try:
-            self.relay.value = state
-            if state and Config.ALARM_BUZZER_ENABLED:
-                self.buzzer.value = 0.5
-                time.sleep(0.1)
-                self.buzzer.value = 0
+        """
+        Activate or deactivate alarm relay using lgpio directly.
+        Only manipulates CH3 relay (GPIO 21).
+        Optionally triggers buzzer for a short beep when activating.
+        """
+        if not self.lgpio_handle:
+            logger.warning("lgpio handle not available! (Mock alarm state)")
             self.alarm_active = state
-            logger.info(f"Alarm {'ACTIVATED' if state else 'DEACTIVATED'}")
+            return
+
+        try:
+            # Alarm relay on CH3 (GPIO 21)
+            lgpio.gpio_write(self.lgpio_handle, self.RELAY_CH1, int(state))
+            self.alarm_active = state
+            logger.info(f"Alarm relay (GPIO {self.RELAY_CH1}) {'ON' if state else 'OFF'}")
+            if state and Config.ALARM_BUZZER_ENABLED:
+                # Optionally buzz for feedback (if you have a buzzer)
+                # Uncomment and adjust if you want to pulse a buzzer
+                # lgpio.gpio_write(self.lgpio_handle, self.BUZZER_PIN, 1)
+                # time.sleep(0.1)
+                # lgpio.gpio_write(self.lgpio_handle, self.BUZZER_PIN, 0)
+                pass
         except Exception as e:
-            logger.error(f"Alarm control error: {e}")
+            logger.error(f"Alarm relay control error: {e}")
 
     def cleanup(self):
-        if HARDWARE_AVAILABLE:
-            try:
-                if self.relay: self.relay.close()
-                if self.buzzer: self.buzzer.close()
-                logger.info("GPIO resources released")
-            except Exception as e:
-                logger.error(f"GPIO cleanup error: {e}")
+        """Set relays off and release lgpio handle."""
+        if not self.lgpio_handle:
+            return
+        try:
+            for pin in [self.RELAY_CH3, self.RELAY_CH2, self.RELAY_CH1]:
+                lgpio.gpio_write(self.lgpio_handle, pin, 0)
+            lgpio.gpiochip_close(self.lgpio_handle)
+            logger.info("lgpio: relays set to OFF, handle closed")
+            self.lgpio_handle = None
+        except Exception as e:
+            logger.error(f"lgpio cleanup error: {e}")
+
 
 # ===== SIM7600 Controller =====
 class SIM7600Controller:
