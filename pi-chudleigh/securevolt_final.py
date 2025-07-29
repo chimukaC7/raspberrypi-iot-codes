@@ -10,6 +10,11 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import threading
 from queue import Queue
+import cv2
+import numpy as np
+from collections import deque
+import torch
+from gpiozero import OutputDevice
 
 try:
     import lgpio
@@ -68,7 +73,7 @@ class Config:
     CAMERA_TIMEOUT = 10
     # SNAPSHOT_URL removed; only RTSP used now
 
-    MIN_CONTOUR_AREA = 1000
+    MIN_CONTOUR_AREA = 10000
     CAPTURE_INTERVAL = 0.5
     SAVE_FOLDER = "/home/zesco/hikvision_captures"
     MAX_STORAGE_HOURS = 2
@@ -90,6 +95,7 @@ class Config:
     SFTP_USER = "root"
     SFTP_PASS = "root123"
     SFTP_UPLOAD_PATH = "/var/www/html/AntiVandalismSensorSystem/public/videos/"  # Folder on SFTP server
+    # SFTP_UPLOAD_PATH = "/var/www/html/AntiVandalismSensorSystem/public/videos/" + DEVICE_SERIAL + "/"# Folder on SFTP server
 
 # ===== Environmental Sensor =====
 class EnvironmentalSensor:
@@ -124,69 +130,60 @@ class EnvironmentalSensor:
 
 # ===== Hardware Controller =====
 class HardwareController:
-    # BCM pin mapping for relays and buzzer
-    RELAY_CH3 = 21  # For alarm (BOARD 40)
-    RELAY_CH2 = 20  # (BOARD 38)
-    RELAY_CH1 = 26  # (BOARD 37)
-    BUZZER_PIN = 19  # Example: change as needed!
+    # BCM pin mapping for relays
+    RELAY_CH3 = 21  # (BOARD 40)
+    RELAY_CH2 = 20  # (BOARD 38) - optional
+    RELAY_CH1 = 26  # (BOARD 37) - optional
 
     def __init__(self):
         self.alarm_active = False
-        self.lgpio_handle = None
-        self.env_sensor = EnvironmentalSensor()
-        self._init_lgpio()
+        self.relay_ch3 = None
+        self.relay_ch2 = None
+        self.relay_ch1 = None
+        self.env_sensor = EnvironmentalSensor()  # Assuming this class is defined elsewhere
+        self._init_gpiozero()
 
-    def _init_lgpio(self):
+    def _init_gpiozero(self):
         try:
-            # Open a handle to /dev/gpiochip0
-            self.lgpio_handle = lgpio.gpiochip_open(0)
-            # Set relays and buzzer as outputs, initially off
-            for pin in [self.RELAY_CH3, self.RELAY_CH2, self.RELAY_CH1]:
-                lgpio.gpio_claim_output(self.lgpio_handle, pin, 0)
-            # If using a buzzer on another pin, claim it as output too:
-            # lgpio.gpio_claim_output(self.lgpio_handle, self.BUZZER_PIN, 0)
-            logger.info("lgpio: GPIOs claimed for relays (and buzzer if used)")
+            # Initialize relays with initial value OFF (False)
+            self.relay_ch3 = OutputDevice(self.RELAY_CH3, active_high=False, initial_value=False)
+            self.relay_ch2 = OutputDevice(self.RELAY_CH2, active_high=False, initial_value=False)
+            self.relay_ch1 = OutputDevice(self.RELAY_CH1, active_high=False, initial_value=False)
+            logger.info("gpiozero: Relays initialized")
         except Exception as e:
-            logger.error(f"lgpio init failed: {e}")
+            logger.error(f"gpiozero init failed: {e}")
 
     def activate_alarm(self, state=True):
         """
-        Activate or deactivate alarm relay using lgpio directly.
-        Only manipulates CH3 relay (GPIO 21).
-        Optionally triggers buzzer for a short beep when activating.
+        Activate or deactivate alarm relay using gpiozero.
         """
-        if not self.lgpio_handle:
-            logger.warning("lgpio handle not available! (Mock alarm state)")
+        if not self.relay_ch3:
+            logger.warning("Relay CH3 not initialized! (Mock alarm state)")
             self.alarm_active = state
             return
 
         try:
-            # Alarm relay on CH3 (GPIO 21)
-            lgpio.gpio_write(self.lgpio_handle, self.RELAY_CH1, int(state))
+            if state:
+                self.relay_ch3.on()
+            else:
+                self.relay_ch3.off()
             self.alarm_active = state
-            logger.info(f"Alarm relay (GPIO {self.RELAY_CH1}) {'ON' if state else 'OFF'}")
-            if state and Config.ALARM_BUZZER_ENABLED:
-                # Optionally buzz for feedback (if you have a buzzer)
-                # Uncomment and adjust if you want to pulse a buzzer
-                # lgpio.gpio_write(self.lgpio_handle, self.BUZZER_PIN, 1)
-                # time.sleep(0.1)
-                # lgpio.gpio_write(self.lgpio_handle, self.BUZZER_PIN, 0)
-                pass
+            logger.info(f"Alarm relay (GPIO {self.RELAY_CH3}) {'ON' if state else 'OFF'}")
         except Exception as e:
             logger.error(f"Alarm relay control error: {e}")
 
     def cleanup(self):
-        """Set relays off and release lgpio handle."""
-        if not self.lgpio_handle:
-            return
+        """Turn off relays and release resources."""
         try:
-            for pin in [self.RELAY_CH3, self.RELAY_CH2, self.RELAY_CH1]:
-                lgpio.gpio_write(self.lgpio_handle, pin, 0)
-            lgpio.gpiochip_close(self.lgpio_handle)
-            logger.info("lgpio: relays set to OFF, handle closed")
-            self.lgpio_handle = None
+            if self.relay_ch3:
+                self.relay_ch3.off()
+            if self.relay_ch2:
+                self.relay_ch2.off()
+            if self.relay_ch1:
+                self.relay_ch1.off()
+            logger.info("gpiozero: relays set to OFF")
         except Exception as e:
-            logger.error(f"lgpio cleanup error: {e}")
+            logger.error(f"gpiozero cleanup error: {e}")
 
 
 # ===== SIM7600 Controller =====
@@ -284,6 +281,7 @@ class FileUploader:
         self.ssh = None
         self.sftp = None
         self._connect()
+
     def _connect(self):
         try:
             self.ssh = paramiko.SSHClient()
@@ -295,19 +293,55 @@ class FileUploader:
             logger.error(f"SFTP failed: {e}")
             self.ssh = None
             self.sftp = None
+
+    def _mkdir_p(self, remote_path):
+        """Recursively create remote directories if they do not exist"""
+        dirs = []
+        while True:
+            head, tail = os.path.split(remote_path)
+            if head == remote_path:  # Reached root
+                if head and not self._exists(head):
+                    dirs.insert(0, head)
+                break
+            if tail:
+                dirs.insert(0, tail)
+            remote_path = head
+        path = ""
+        for dir in dirs:
+            path = os.path.join(path, dir)
+            try:
+                self.sftp.stat(path)
+            except IOError:
+                self.sftp.mkdir(path)
+
+    def _exists(self, path):
+        """Check if a remote path exists"""
+        try:
+            self.sftp.stat(path)
+            return True
+        except IOError:
+            return False
+
     def upload_image(self, src, dst):
         try:
             if not self.sftp:
                 self._connect()
+
+            remote_dir = os.path.dirname(dst)
+            self._mkdir_p(remote_dir)
+
             self.sftp.put(src, dst)
             logger.info(f"Uploaded {src} to {dst}")
             return True
         except Exception as e:
             logger.error(f"Upload failed: {e}")
             return False
+
     def close(self):
-        if self.sftp: self.sftp.close()
-        if self.ssh: self.ssh.close()
+        if self.sftp:
+            self.sftp.close()
+        if self.ssh:
+            self.ssh.close()
 
 # ===== MQTT Client =====
 class SecureVoltMQTT:
@@ -380,6 +414,7 @@ class RTSPMotionDetector:
         self.mqtt_client = mqtt_client
         self.hardware = hardware
         os.makedirs(self.save_folder, exist_ok=True)
+        self.timestamp_mask = None
 
     def _cleanup_old_files(self):
         cutoff = time.time() - Config.MAX_STORAGE_HOURS * 3600
@@ -389,26 +424,81 @@ class RTSPMotionDetector:
                 os.remove(p)
                 logger.info(f"Removed old file: {fn}")
 
+    def _init_timestamp_mask(self, frame):
+        """Auto-detect and mask out bright overlay in top-left corner."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+        h, w = blurred.shape
+        roi = blurred[0:int(h * 0.15), 0:int(w * 0.4)]  # Top-left region
+
+        # Threshold to highlight bright overlay (e.g. white timestamp)
+        _, thresh = cv2.threshold(roi, 200, 255, cv2.THRESH_BINARY)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            x, y, tw, th = cv2.boundingRect(largest)
+            ignore_x_start = x
+            ignore_x_end = x + tw
+            ignore_y_start = y
+            ignore_y_end = y + th
+        else:
+            # Fallback: small box in top-left
+            ignore_x_start = 0
+            ignore_x_end = 250
+            ignore_y_start = 0
+            ignore_y_end = 60
+
+        # Create mask (255 = use, 0 = ignore)
+        timestamp_mask = np.ones_like(gray, dtype=np.uint8) * 255
+        timestamp_mask[ignore_y_start:ignore_y_end, ignore_x_start:ignore_x_end] = 0
+        self.timestamp_mask = timestamp_mask
+
     def run(self):
         logger.info(f"Starting RTSP motion detection on {self.rtsp_url}")
         cap = cv2.VideoCapture(self.rtsp_url)
         if not cap.isOpened():
             logger.error(f"Failed to connect to RTSP stream: {self.rtsp_url}")
             return
+
         ret, frame1 = cap.read()
+        if not ret:
+            logger.error("Failed to grab initial frame")
+            cap.release()
+            return
+
+        # Initialize timestamp mask with first frame
+        self._init_timestamp_mask(frame1)
+
+        # Apply mask and preprocess first frame
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+        blurred1 = cv2.GaussianBlur(gray1, (21, 21), 0)
+        masked1 = cv2.bitwise_and(blurred1, blurred1, mask=self.timestamp_mask)
+
         ret, frame2 = cap.read()
+        if not ret:
+            logger.error("Failed to grab second frame")
+            cap.release()
+            return
+
         last_capture = 0
         last_cleanup = time.time()
         while cap.isOpened():
             if time.time() - last_cleanup > 1800:
                 self._cleanup_old_files()
                 last_cleanup = time.time()
-            diff = cv2.absdiff(frame1, frame2)
-            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, thresh = cv2.threshold(blur, 20, 255, cv2.THRESH_BINARY)
-            dilated = cv2.dilate(thresh, None, iterations=3)
-            contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Preprocess next frame
+            gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+            blurred2 = cv2.GaussianBlur(gray2, (21, 21), 0)
+            masked2 = cv2.bitwise_and(blurred2, blurred2, mask=self.timestamp_mask)
+
+            # Frame differencing on masked frames
+            diff = cv2.absdiff(masked1, masked2)
+            _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            dilated = cv2.dilate(thresh, None, iterations=2)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
             motion = False
             max_area = 0
             for cnt in contours:
@@ -416,18 +506,17 @@ class RTSPMotionDetector:
                 if area < self.min_contour_area:
                     continue
                 x, y, w, h = cv2.boundingRect(cnt)
-                cv2.rectangle(frame1, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.rectangle(frame2, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 motion = True
                 max_area = max(max_area, area)
+
             if motion and (time.time() - last_capture > self.motion_cooldown):
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
                 filepath = os.path.join(self.save_folder, filename)
-                cv2.imwrite(filepath, frame1)
+                cv2.imwrite(filepath, frame2)
                 logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
-                # Trigger alarm
                 self.hardware.activate_alarm(True)
-                # Upload
                 sftp_dst = os.path.join(Config.SFTP_UPLOAD_PATH, filename)
                 uploaded = self.uploader.upload_image(filepath, sftp_dst)
                 if uploaded:
@@ -443,10 +532,10 @@ class RTSPMotionDetector:
                     logger.error(f"Failed to upload {filepath}")
                 last_capture = time.time()
             else:
-                # Optionally deactivate alarm if no recent motion
                 if self.hardware.alarm_active and (time.time() - last_capture > Config.ALARM_DURATION):
                     self.hardware.activate_alarm(False)
-            frame1 = frame2
+
+            masked1 = masked2  # move to next pair
             ret, frame2 = cap.read()
             if not ret:
                 logger.error("Failed to grab RTSP frame")
@@ -505,4 +594,11 @@ class SecureVoltApp:
 
 if __name__ == "__main__":
     app = SecureVoltApp()
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user (KeyboardInterrupt)")
+        app.shutdown()
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        app.shutdown()
