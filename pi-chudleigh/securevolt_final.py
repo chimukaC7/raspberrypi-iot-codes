@@ -52,7 +52,7 @@ logger = logging.getLogger("SecureVolt")
 class Config:
     DEVICE_ID = "SecureVolt_Pi5"
     DEVICE_SERIAL = "6f3c637fa3cdead6"
-    LOCATION_CODE = "CHUDLEIGH_SUBSTATION"
+    LOCATION_CODE = "CHUDLEIGH_TRANSFORMER_STATION"
 
     ALARM_RELAY_PIN = 40
     BUZZER_PIN = 38
@@ -64,7 +64,7 @@ class Config:
         "alarm": "sim7600/alarm",
         "sensor": "sim7600/sensor",
         "image": "sim7600/image",
-        "command": "sim7600/command"
+        "command": "sim7600/" + DEVICE_SERIAL + "/alarm/control",
     }
 
     CAMERA_IP = "192.168.1.64"
@@ -364,8 +364,9 @@ class SecureVoltMQTT:
         try:
             payload = json.loads(msg.payload.decode())
             cmd = payload.get("command")
-            if cmd == "activate_alarm": self.hardware.activate_alarm(True)
-            elif cmd == "deactivate_alarm": self.hardware.activate_alarm(False)
+            print("received command:", cmd)
+            if cmd == "on": self.hardware.activate_alarm(True)
+            elif cmd == "off": self.hardware.activate_alarm(False)
         except Exception as e:
             logger.error(f"MQTT msg error: {e}")
 
