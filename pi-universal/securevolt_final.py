@@ -75,6 +75,7 @@ def _get_device_serial():
     mac = uuid.getnode()
     return f"{mac:012x}"
 
+
 def _get_ip_addresses():
     """
     Returns a list of IPv4 addresses for the host (no loopback).
@@ -330,16 +331,17 @@ class SIM7600Controller:
         r = self.send_at_command("AT+CREG?")
         m = re.search(r'\+CREG: (\d,\d)', r)
         return {
-            '0,1':'Registered - home network','0,5':'Registered - roaming',
-            '0,2':'Searching','0,3':'Denied','0,4':'Unknown'
+            '0,1': 'Registered - home network', '0,5': 'Registered - roaming',
+            '0,2': 'Searching', '0,3': 'Denied', '0,4': 'Unknown'
         }.get(m.group(1), "Unknown")
 
     def get_signal_quality(self):
         r = self.send_at_command("AT+CSQ")
         m = re.search(r'\+CSQ: (\d+),', r)
-        if not m or int(m.group(1))==99:
-            return {"quality":"Unknown","dbm":"N/A","rssi":None}
-        v=int(m.group(1)); return {"quality":f"{(v/31)*100:.1f}%","dbm":f"{-113+2*v} dBm","rssi":v}
+        if not m or int(m.group(1)) == 99:
+            return {"quality": "Unknown", "dbm": "N/A", "rssi": None}
+        v = int(m.group(1));
+        return {"quality": f"{(v / 31) * 100:.1f}%", "dbm": f"{-113 + 2 * v} dBm", "rssi": v}
 
     def get_gps_data(self, retries=3):
         for _ in range(retries):
