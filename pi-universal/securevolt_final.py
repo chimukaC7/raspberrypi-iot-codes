@@ -19,6 +19,8 @@ from gpiozero import OutputDevice
 import socket
 import uuid
 import subprocess
+import sqlite3
+from typing import Optional, Tuple
 
 try:
     import lgpio
@@ -26,7 +28,6 @@ try:
     import board
     import busio
     from adafruit_bme280 import basic as adafruit_bme280
-
     HARDWARE_AVAILABLE = True
 except ImportError as e:
     HARDWARE_AVAILABLE = False
@@ -91,7 +92,7 @@ def _get_ip_addresses():
     except Exception:
         pass
 
-    # Fallback: socket trick (may only give one IP)
+    # Fallbacks
     ips = set()
     try:
         # Common trick to discover outbound IP
@@ -102,7 +103,6 @@ def _get_ip_addresses():
     except Exception:
         pass
 
-    # Also try gethostbyname_ex
     try:
         host_ips = socket.gethostbyname_ex(socket.gethostname())[2]
         for ip in host_ips:
@@ -135,7 +135,7 @@ class Config:
     DEVICE_ID = "SecureVolt_Pi5"
     # Programmatically generated values:
     DEVICE_SERIAL = GENERATED_DEVICE_SERIAL
-    IP_ADDRESS = GENERATED_IP_ADDRESS  # <-- list of IPv4 strings
+    IP_ADDRESS = GENERATED_IP_ADDRESS  # list of IPv4 strings
 
     LOCATION_CODE = "LEVY_SUBSTATION"
 
@@ -149,7 +149,7 @@ class Config:
         "alarm": "sim7600/alarm",
         "sensor": "sim7600/sensor",
         "image": "sim7600/image",
-        # NOTE: command topic includes dynamically-determined DEVICE_SERIAL
+        # command topic includes dynamically-determined DEVICE_SERIAL
         "command": "sim7600/" + DEVICE_SERIAL + "/alarm/control",
     }
 
@@ -157,7 +157,6 @@ class Config:
     CAMERA_USER = "admin"
     CAMERA_PASS = "Securevolt1"
     CAMERA_TIMEOUT = 10
-    # SNAPSHOT_URL removed; only RTSP used now
 
     MIN_CONTOUR_AREA = 10000
     CAPTURE_INTERVAL = 0.5
@@ -181,7 +180,83 @@ class Config:
     SFTP_USER = "root"
     SFTP_PASS = "root123"
     SFTP_UPLOAD_PATH = "/var/www/html/AntiVandalismSensorSystem/public/videos/"  # Folder on SFTP server
-    # SFTP_UPLOAD_PATH = "/var/www/html/AntiVandalismSensorSystem/public/videos/" + DEVICE_SERIAL + "/"# Folder on SFTP server
+    # SFTP_UPLOAD_PATH = "/var/www/html/AntiVandalismSensorSystem/public/videos/" + DEVICE_SERIAL + "/"
+
+    # SQLite DB
+    DB_PATH = os.path.join(os.path.expanduser("~"), "securevolt_alarm.db")
+
+
+# ===== Alarm State Store (SQLite) =====
+class AlarmStateStore:
+    """
+    Persists 'armed' (whether motion may trigger alarm) and 'relay_state' (actual relay ON/OFF).
+    One row per device_serial.
+    """
+    def __init__(self, db_path: str, device_serial: str):
+        self.db_path = db_path
+        self.device_serial = device_serial
+        self._ensure_schema()
+        self._ensure_row()
+
+    def _conn(self):
+        return sqlite3.connect(self.db_path, timeout=5)
+
+    def _ensure_schema(self):
+        with self._conn() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS alarm_state(
+                    device_serial TEXT PRIMARY KEY,
+                    armed INTEGER NOT NULL,
+                    relay_state INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+    def _ensure_row(self):
+        with self._conn() as con:
+            cur = con.execute("SELECT 1 FROM alarm_state WHERE device_serial=?", (self.device_serial,))
+            if cur.fetchone() is None:
+                # Default: armed=1 (motion allowed), relay off
+                con.execute("""
+                    INSERT INTO alarm_state(device_serial, armed, relay_state, updated_at)
+                    VALUES(?, ?, ?, datetime('now'))
+                """, (self.device_serial, 1, 0))
+
+    def get(self) -> Tuple[bool, bool]:
+        """
+        Returns (armed, relay_state) as booleans.
+        """
+        with self._conn() as con:
+            row = con.execute("""
+                SELECT armed, relay_state FROM alarm_state WHERE device_serial=?
+            """, (self.device_serial,)).fetchone()
+            if not row:
+                return (True, False)
+            armed, relay_state = row
+            return (bool(armed), bool(relay_state))
+
+    def set(self, armed: Optional[bool] = None, relay_state: Optional[bool] = None):
+        if armed is None and relay_state is None:
+            return
+        with self._conn() as con:
+            if armed is not None and relay_state is not None:
+                con.execute("""
+                    UPDATE alarm_state
+                    SET armed=?, relay_state=?, updated_at=datetime('now')
+                    WHERE device_serial=?
+                """, (1 if armed else 0, 1 if relay_state else 0, self.device_serial))
+            elif armed is not None:
+                con.execute("""
+                    UPDATE alarm_state
+                    SET armed=?, updated_at=datetime('now')
+                    WHERE device_serial=?
+                """, (1 if armed else 0, self.device_serial))
+            else:
+                con.execute("""
+                    UPDATE alarm_state
+                    SET relay_state=?, updated_at=datetime('now')
+                    WHERE device_serial=?
+                """, (1 if relay_state else 0, self.device_serial))
 
 
 # ===== Environmental Sensor =====
@@ -228,7 +303,7 @@ class HardwareController:
         self.relay_ch3 = None
         self.relay_ch2 = None
         self.relay_ch1 = None
-        self.env_sensor = EnvironmentalSensor()  # Assuming this class is defined elsewhere
+        self.env_sensor = EnvironmentalSensor()
         self._init_gpiozero()
 
     def _init_gpiozero(self):
@@ -349,13 +424,14 @@ class SIM7600Controller:
                 r = self.send_at_command("AT+CGPSINFO", timeout=10)
                 m = re.search(r'\+CGPSINFO: ([^,]+),([NS]),([^,]+),([EW])', r)
                 if m:
-                    def conv(raw, dir):
-                        d = float(raw[:2] if dir in 'NS' else raw[:3])
-                        mpart = float(raw[2:] if dir in 'NS' else raw[3:])
+                    def conv(raw, dirc):
+                        d = float(raw[:2] if dirc in 'NS' else raw[:3])
+                        mpart = float(raw[2:] if dirc in 'NS' else raw[3:])
                         d += mpart / 60
-                        return -d if dir in 'SW' else d
-
-                    return {"latitude": conv(m.group(1), m.group(2)), "longitude": conv(m.group(3), m.group(4)), "status": "Fix acquired"}
+                        return -d if dirc in 'SW' else d
+                    return {"latitude": conv(m.group(1), m.group(2)),
+                            "longitude": conv(m.group(3), m.group(4)),
+                            "status": "Fix acquired"}
             except Exception as e:
                 logger.error(f"[GPS ERROR] {e}")
             time.sleep(5)
@@ -363,7 +439,7 @@ class SIM7600Controller:
 
     def close(self):
         if self.ser and self.ser.is_open:
-            self.ser.close();
+            self.ser.close()
             logger.info("[SIM7600] Serial connection closed")
 
 
@@ -399,8 +475,8 @@ class FileUploader:
                 dirs.insert(0, tail)
             remote_path = head
         path = ""
-        for dir in dirs:
-            path = os.path.join(path, dir)
+        for dirn in dirs:
+            path = os.path.join(path, dirn)
             try:
                 self.sftp.stat(path)
             except IOError:
@@ -438,8 +514,9 @@ class FileUploader:
 
 # ===== MQTT Client =====
 class SecureVoltMQTT:
-    def __init__(self, hardware_controller):
+    def __init__(self, hardware_controller, alarm_store: AlarmStateStore):
         self.hardware = hardware_controller
+        self.alarm_store = alarm_store
         self.client = mqtt.Client(client_id=Config.DEVICE_ID)
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
@@ -451,16 +528,18 @@ class SecureVoltMQTT:
             self.connected = True
             logger.info("MQTT connected")
             # Publish identity immediately upon successful connection
+            armed, relay_state = self.alarm_store.get()
             ident_msg = {
                 "timestamp": datetime.now().isoformat(),
                 "device_id": Config.DEVICE_ID,
                 "device_info": {
                     "serial": Config.DEVICE_SERIAL,
                     "location_code": Config.LOCATION_CODE,
-                    # publish IP_ADDRESS explicitly as requested
                     "ip_address": Config.IP_ADDRESS,
                 },
-                "event": "device_identity"
+                "event": "device_identity",
+                "armed": armed,
+                "relay_state": relay_state
             }
             self.client.publish(Config.MQTT_TOPICS["status"], json.dumps(ident_msg), qos=1, retain=False)
         else:
@@ -469,12 +548,37 @@ class SecureVoltMQTT:
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode())
-            cmd = payload.get("command")
-            print("received command:", cmd)
-            if cmd == "on":
-                self.hardware.activate_alarm(True)
-            elif cmd == "off":
+            cmd = (payload.get("command") or "").strip().lower()
+            logger.info(f"received command: {cmd}")
+
+            if cmd in ("on", "arm"):
+                # 'on' can also arm and turn on the relay
+                self.alarm_store.set(armed=True)
+                if cmd == "on":
+                    self.hardware.activate_alarm(True)
+                    self.alarm_store.set(relay_state=True)
+
+            elif cmd in ("off", "disarm"):
+                # Disarm and ensure relay OFF
                 self.hardware.activate_alarm(False)
+                self.alarm_store.set(armed=False, relay_state=False)
+
+            else:
+                logger.warning(f"Unknown command: {cmd}")
+                return
+
+            # Ack current state
+            armed, relay_state = self.alarm_store.get()
+            ack = {
+                "timestamp": datetime.now().isoformat(),
+                "device_id": Config.DEVICE_ID,
+                "event": "command_ack",
+                "command": cmd,
+                "armed": armed,
+                "relay_state": relay_state
+            }
+            self.client.publish(Config.MQTT_TOPICS["status"], json.dumps(ack), qos=1)
+
         except Exception as e:
             logger.error(f"MQTT msg error: {e}")
 
@@ -488,9 +592,17 @@ class SecureVoltMQTT:
             return False
 
     def publish_status(self, data):
+        armed, relay_state = self.alarm_store.get()
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "device_id": Config.DEVICE_ID,
+            "status": data,
+            "armed": armed,
+            "relay_state": relay_state
+        }
         self.client.publish(
             Config.MQTT_TOPICS["sensor"],
-            json.dumps({"timestamp": datetime.now().isoformat(), "device_id": Config.DEVICE_ID, "status": data}),
+            json.dumps(payload),
             qos=1
         )
 
@@ -503,16 +615,17 @@ class SecureVoltMQTT:
         )
 
     def publish_sensor_data(self, net, env, alarm, motion):
+        armed, relay_state = self.alarm_store.get()
         msg = {
             "modem": net,
             "timestamp": datetime.now().isoformat(),
             "device_info": {
                 "serial": Config.DEVICE_SERIAL,
                 "location_code": Config.LOCATION_CODE,
-                # include IP_ADDRESS in routine status payloads
                 "ip_address": Config.IP_ADDRESS,
             },
-            "alarm_status": alarm,
+            "armed": armed,
+            "alarm_status": relay_state,
             "environment": env,
             "motion_status": motion
         }
@@ -520,7 +633,6 @@ class SecureVoltMQTT:
 
     def publish_image_alert(self, sftp_path, metadata):
         try:
-            # sftp_path is server file path; just publish metadata
             self.client.publish(
                 Config.MQTT_TOPICS["image"],
                 json.dumps({
@@ -544,7 +656,7 @@ class SecureVoltMQTT:
 
 # ===== RTSP Motion Detector (includes upload + MQTT) =====
 class RTSPMotionDetector:
-    def __init__(self, rtsp_url, save_folder, min_contour_area, motion_cooldown, uploader, mqtt_client, hardware):
+    def __init__(self, rtsp_url, save_folder, min_contour_area, motion_cooldown, uploader, mqtt_client, hardware, alarm_store: AlarmStateStore):
         self.rtsp_url = rtsp_url
         self.save_folder = save_folder
         self.min_contour_area = min_contour_area
@@ -552,6 +664,7 @@ class RTSPMotionDetector:
         self.uploader = uploader
         self.mqtt_client = mqtt_client
         self.hardware = hardware
+        self.alarm_store = alarm_store
         os.makedirs(self.save_folder, exist_ok=True)
         self.timestamp_mask = None
 
@@ -650,32 +763,42 @@ class RTSPMotionDetector:
                 max_area = max(max_area, area)
 
             if motion and (time.time() - last_capture > self.motion_cooldown):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
-                filepath = os.path.join(self.save_folder, filename)
-                cv2.imwrite(filepath, frame2)
-                logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
-                self.hardware.activate_alarm(True)
-                sftp_dst = os.path.join(Config.SFTP_UPLOAD_PATH, filename)
-                uploaded = self.uploader.upload_image(filepath, sftp_dst)
-                if uploaded:
-                    metadata = {
-                        "location": Config.LOCATION_CODE,
-                        "reason": "motion_detected",
-                        "area": max_area,
-                        "local_file": filepath,
-                        "sftp_path": sftp_dst,
-                        # Include identifiers for convenience in downstream consumers
-                        "device_serial": Config.DEVICE_SERIAL,
-                        "ip_address": Config.IP_ADDRESS,
-                    }
-                    self.mqtt_client.publish_image_alert(sftp_dst, metadata)
+                armed, relay_state = self.alarm_store.get()
+                if not armed:
+                    logger.info("[RTSP] Motion detected but system is DISARMED; suppressing alarm.")
                 else:
-                    logger.error(f"Failed to upload {filepath}")
-                last_capture = time.time()
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
+                    filepath = os.path.join(self.save_folder, filename)
+                    cv2.imwrite(filepath, frame2)
+                    logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
+
+                    # Turn ON relay due to motion (only when armed)
+                    self.hardware.activate_alarm(True)
+                    self.alarm_store.set(relay_state=True)
+
+                    sftp_dst = os.path.join(Config.SFTP_UPLOAD_PATH, filename)
+                    uploaded = self.uploader.upload_image(filepath, sftp_dst)
+                    if uploaded:
+                        metadata = {
+                            "location": Config.LOCATION_CODE,
+                            "reason": "motion_detected",
+                            "area": max_area,
+                            "local_file": filepath,
+                            "sftp_path": sftp_dst,
+                            "device_serial": Config.DEVICE_SERIAL,
+                            "ip_address": Config.IP_ADDRESS,
+                        }
+                        self.mqtt_client.publish_image_alert(sftp_dst, metadata)
+                    else:
+                        logger.error(f"Failed to upload {filepath}")
+                    last_capture = time.time()
             else:
-                if self.hardware.alarm_active and (time.time() - last_capture > Config.ALARM_DURATION):
+                # Auto-off after duration only if currently ON and still armed
+                armed, relay_state = self.alarm_store.get()
+                if relay_state and armed and (time.time() - last_capture > Config.ALARM_DURATION):
                     self.hardware.activate_alarm(False)
+                    self.alarm_store.set(relay_state=False)
 
             masked1 = masked2  # move to next pair
             ret, frame2 = cap.read()
@@ -691,17 +814,26 @@ class SecureVoltApp:
     def __init__(self):
         global hardware, mqtt_client
         hardware = HardwareController()
+
+        # NEW: alarm state store
+        self.alarm_store = AlarmStateStore(Config.DB_PATH, Config.DEVICE_SERIAL)
+        armed, relay_state = self.alarm_store.get()
+
+        # Ensure physical relay matches persisted relay_state on boot
+        hardware.activate_alarm(relay_state)
+
         self.modem = SIM7600Controller()
-        mqtt_client = SecureVoltMQTT(hardware)
+        mqtt_client = SecureVoltMQTT(hardware, self.alarm_store)  # pass store into MQTT
         self.uploader = FileUploader()
         self.rtsp_detector = RTSPMotionDetector(
             Config.RTSP_URL, Config.SAVE_FOLDER,
             Config.RTSP_MIN_CONTOUR_AREA, Config.RTSP_MOTION_COOLDOWN,
-            self.uploader, mqtt_client, hardware
+            self.uploader, mqtt_client, hardware,
+            self.alarm_store  # pass store into motion detector
         )
         self.running = False
 
-        logger.info(f"Device identity: serial={Config.DEVICE_SERIAL}, ip_address={Config.IP_ADDRESS}")
+        logger.info(f"Device identity: serial={Config.DEVICE_SERIAL}, ip_address={Config.IP_ADDRESS}, armed={armed}, relay={relay_state}")
 
     def run(self):
         self.running = True
