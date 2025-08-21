@@ -4,7 +4,7 @@ from flask import Flask, Response
 app = Flask(__name__)
 
 # RTSP URL from Tapo camera
-RTSP_URL = "rtsp://securevolt1:Securevolt1@10.42.0.45:554/stream1"
+RTSP_URL = "rtsp://securevolt1:Securevolt1@10.42.0.132:554/stream1"
 cap = cv2.VideoCapture(RTSP_URL)
 
 def generate_frames():
