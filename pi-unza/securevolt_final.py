@@ -299,14 +299,13 @@ class EnvironmentalSensor:
 
     def read(self):
         if not self.sensor:
-            return {"status": "Sensor not connected"}
-        return {
-            "temperature": round(0, 2),
-            "humidity": round(0, 2),
-            "pressure": round(0, 2),
-            "altitude": round(0, 2),
-            "status": "Sensor not connected",
-        }
+            return {
+                "temperature": round(0, 2),
+                "humidity": round(0, 2),
+                "pressure": round(0, 2),
+                "altitude": round(0, 2),
+                "status": "Sensor not connected",
+            }
         try:
             return {
                 "temperature": round(self.sensor.temperature, 2),
@@ -317,10 +316,6 @@ class EnvironmentalSensor:
             }
         except Exception as e:
             return {
-                "temperature": round(0, 2),
-                "humidity": round(0, 2),
-                "pressure": round(0, 2),
-                "altitude": round(0, 2),
                 "status": f"Error: {str(e)}",
             }
 
