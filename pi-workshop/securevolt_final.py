@@ -25,6 +25,8 @@ import requests  # noqa: F401
 from requests.auth import HTTPDigestAuth  # noqa: F401
 
 try:
+    # Nudge OpenCV/FFmpeg to be more resilient for RTSP
+    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;7000000|max_delay;500000")
     import lgpio  # noqa: F401
     from gpiozero import OutputDevice, PWMOutputDevice  # noqa: F401
     import board
@@ -153,7 +155,7 @@ class Config:
 
     # Motion / camera
     CAMERA_IP = "10.42.0.132"
-    CAMERA_USER = "admin"
+    CAMERA_USER = "securevolt1"
     CAMERA_PASS = "Securevolt1"
     CAMERA_TIMEOUT = 10
 
@@ -170,7 +172,7 @@ class Config:
     COMMAND_DELAY = 0.1
 
     # RTSP
-    RTSP_URL = f"rtsp://securevolt1:Securevolt1@{CAMERA_IP}:554/stream1"
+    RTSP_URL = f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{CAMERA_IP}:554/stream1"
     RTSP_MIN_CONTOUR_AREA = MIN_CONTOUR_AREA
     RTSP_MOTION_COOLDOWN = 3
 
@@ -296,7 +298,13 @@ class EnvironmentalSensor:
 
     def read(self):
         if not self.sensor:
-            return {"status": "Sensor not connected"}
+            return {
+                "temperature": round(0, 2),
+                "humidity": round(0, 2),
+                "pressure": round(0, 2),
+                "altitude": round(0, 2),
+                "status": "Sensor not connected",
+            }
         try:
             return {
                 "temperature": round(self.sensor.temperature, 2),
@@ -580,69 +588,137 @@ class SIM7600Controller:
 
 # ===== File Uploader =====
 class FileUploader:
+    """
+    Resilient SFTP uploader with:
+      - SSH keepalive pings (every 30s)
+      - Connection health checks before each upload
+      - Automatic reconnect + exponential backoff on EOF/SSH/socket errors
+    """
     def __init__(self):
         self.ssh = None
         self.sftp = None
         self._connect()
 
     def _connect(self):
+        # Close any existing handles cleanly
         try:
-            self.ssh = paramiko.SSHClient()
-            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(Config.SFTP_HOST, port=Config.SFTP_PORT, username=Config.SFTP_USER, password=Config.SFTP_PASS, timeout=10)
-            self.sftp = self.ssh.open_sftp()
-            logger.info("SFTP connected")
-        except Exception as e:
-            logger.error(f"SFTP failed: {e}")
-            self.ssh = None
-            self.sftp = None
+            if self.sftp:
+                self.sftp.close()
+        except Exception:
+            pass
+        try:
+            if self.ssh:
+                self.ssh.close()
+        except Exception:
+            pass
 
-    def _mkdir_p(self, remote_path):
-        """Recursively create remote directories if they do not exist"""
-        dirs = []
-        rp = remote_path
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Initial connect
+        self.ssh.connect(
+            Config.SFTP_HOST,
+            port=Config.SFTP_PORT,
+            username=Config.SFTP_USER,
+            password=Config.SFTP_PASS,
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+        )
+        # Keep the TCP alive at SSH layer (server-friendly)
+        try:
+            self.ssh.get_transport().set_keepalive(30)
+        except Exception:
+            pass
+
+        self.sftp = self.ssh.open_sftp()
+        logger.info("SFTP connected (with keepalive)")
+
+    def _healthy(self) -> bool:
+        """Return True if SSH/SFTP look usable."""
+        try:
+            tr = self.ssh.get_transport() if self.ssh else None
+            if not tr or not tr.is_active():
+                return False
+            # Probe SFTP by doing a cheap stat on the remote root.
+            self.sftp.listdir(".")
+            return True
+        except Exception:
+            return False
+
+    def _ensure_connected(self):
+        if not self._healthy():
+            logger.warning("SFTP unhealthy → reconnecting")
+            self._connect()
+
+    def _mkdir_p(self, remote_path: str):
+        """Recursively create remote directories if they do not exist."""
+        parts = []
+        path = remote_path
+        # Normalize to POSIX pieces (Paramiko expects /)
         while True:
-            head, tail = os.path.split(rp)
-            if head == rp:  # Reached root
-                if head and not self._exists(head):
-                    dirs.insert(0, head)
-                break
+            head, tail = os.path.split(path)
             if tail:
-                dirs.insert(0, tail)
-            rp = head
-        path = ""
-        for dirn in dirs:
-            path = os.path.join(path, dirn)
+                parts.append(tail)
+            if head in ("", "/"):
+                if head:
+                    parts.append("/")
+                break
+            path = head
+        parts = list(reversed(parts))
+
+        cur = ""
+        for part in parts[:-1]:  # all but the leaf file/dir
+            if part == "/":
+                cur = "/"
+                continue
+            cur = (cur + "/" + part) if cur != "/" else ("/" + part)
             try:
-                self.sftp.stat(path)
+                self.sftp.stat(cur)
             except IOError:
-                self.sftp.mkdir(path)
+                self.sftp.mkdir(cur)
 
-    def _exists(self, path):
-        try:
-            self.sftp.stat(path)
-            return True
-        except IOError:
-            return False
-
-    def upload_image(self, src, dst):
-        try:
-            if not self.sftp:
-                self._connect()
-            remote_dir = os.path.dirname(dst)
-            self._mkdir_p(remote_dir)
-            self.sftp.put(src, dst)
-            logger.info(f"Uploaded {src} to {dst}")
-            return True
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
-            return False
+    def upload_image(self, src: str, dst: str) -> bool:
+        """
+        Robust upload with retries. On known transient errors, reconnect + retry.
+        """
+        max_attempts = 5
+        delay = 1.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._ensure_connected()
+                remote_dir = os.path.dirname(dst)
+                if remote_dir:
+                    self._mkdir_p(os.path.join(remote_dir, ""))  # ensure dir ends with '/'
+                self.sftp.put(src, dst)
+                logger.info(f"Uploaded {src} to {dst}")
+                return True
+            except (paramiko.SSHException, EOFError, OSError, socket.timeout) as e:
+                msg = str(e) or e.__class__.__name__
+                logger.warning(f"Upload attempt {attempt}/{max_attempts} failed: {msg}")
+                # Reconnect then backoff and retry
+                try:
+                    self._connect()
+                except Exception as re:
+                    logger.error(f"SFTP reconnect error: {re}")
+                time.sleep(delay)
+                delay = min(delay * 2, 10.0)
+            except Exception as e:
+                logger.error(f"Upload failed (non-retryable): {e}")
+                return False
+        logger.error(f"Upload failed after {max_attempts} attempts (giving up)")
+        return False
 
     def close(self):
-        if self.sftp:
-            self.sftp.close()
-        if self.ssh:
-            self.ssh.close()
+        try:
+            if self.sftp:
+                self.sftp.close()
+        except Exception:
+            pass
+        try:
+            if self.ssh:
+                self.ssh.close()
+        except Exception:
+            pass
 
 
 # ===== MQTT Client =====
@@ -750,14 +826,18 @@ class RTSPMotionDetector:
         self.alarm_store = alarm_store
         os.makedirs(self.save_folder, exist_ok=True)
         self.timestamp_mask = None
+        self.cap = None
 
     def _cleanup_old_files(self):
         cutoff = time.time() - Config.MAX_STORAGE_HOURS * 3600
         for fn in os.listdir(self.save_folder):
             p = os.path.join(self.save_folder, fn)
             if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
-                os.remove(p)
-                logger.info(f"Removed old file: {fn}")
+                try:
+                    os.remove(p)
+                    logger.info(f"Removed old file: {fn}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove {fn}: {e}")
 
     def _init_timestamp_mask(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -766,9 +846,7 @@ class RTSPMotionDetector:
         roi = blurred[0 : int(h * 0.15), 0 : int(w * 0.4)]
         _, thresh = cv2.threshold(roi, 200, 255, cv2.THRESH_BINARY)
 
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             largest = max(contours, key=cv2.contourArea)
             x, y, tw, th = cv2.boundingRect(largest)
@@ -786,38 +864,103 @@ class RTSPMotionDetector:
         timestamp_mask[ignore_y_start:ignore_y_end, ignore_x_start:ignore_x_end] = 0
         self.timestamp_mask = timestamp_mask
 
+    def _open_capture(self, attempts: int = 6, base_delay: float = 1.0) -> bool:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+        delay = base_delay
+        for i in range(1, attempts + 1):
+            try:
+                logger.info(f"[RTSP] Opening stream (attempt {i}/{attempts}) → {self.rtsp_url}")
+                # Prefer FFmpeg backend for RTSP
+                cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                # A quick sanity check
+                ok, _ = cap.read()
+                if ok:
+                    self.cap = cap
+                    logger.info("[RTSP] Stream opened successfully")
+                    return True
+                else:
+                    cap.release()
+            except Exception as e:
+                logger.warning(f"[RTSP] Open attempt {i} failed: {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+        logger.error("[RTSP] Failed to open stream after retries")
+        return False
+
     def run(self):
         logger.info(f"Starting RTSP motion detection on {self.rtsp_url}")
-        cap = cv2.VideoCapture(self.rtsp_url)
-        if not cap.isOpened():
+
+        if not self._open_capture():
             logger.error(f"Failed to connect to RTSP stream: {self.rtsp_url}")
             return
 
-        ret, frame1 = cap.read()
-        if not ret:
-            logger.error("Failed to grab initial frame")
-            cap.release()
-            return
+        # Prime two frames; if fails, try to reopen
+        ok, frame1 = self.cap.read()
+        if not ok:
+            logger.warning("[RTSP] Failed to grab initial frame → reopening")
+            if not self._open_capture():
+                return
+            ok, frame1 = self.cap.read()
+            if not ok:
+                logger.error("[RTSP] Could not grab initial frame after reopen")
+                return
 
         self._init_timestamp_mask(frame1)
-
         gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
         blurred1 = cv2.GaussianBlur(gray1, (21, 21), 0)
         masked1 = cv2.bitwise_and(blurred1, blurred1, mask=self.timestamp_mask)
 
-        ret, frame2 = cap.read()
-        if not ret:
-            logger.error("Failed to grab second frame")
-            cap.release()
-            return
+        ok, frame2 = self.cap.read()
+        if not ok:
+            logger.warning("[RTSP] Failed to grab second frame → reopening")
+            if not self._open_capture():
+                return
+            ok, frame2 = self.cap.read()
+            if not ok:
+                logger.error("[RTSP] Could not grab second frame after reopen")
+                return
 
         last_capture = 0.0
         last_cleanup = time.time()
-        while cap.isOpened():
+        consecutive_failures = 0
+        max_failures_before_reopen = 5
+
+        while True:
+            # Housekeeping
             if time.time() - last_cleanup > 1800:
                 self._cleanup_old_files()
                 last_cleanup = time.time()
 
+            # Read next frame with auto-reopen on repeated failure
+            ok, frame2 = self.cap.read()
+            if not ok:
+                consecutive_failures += 1
+                logger.warning(f"[RTSP] Failed to grab frame ({consecutive_failures}/{max_failures_before_reopen})")
+                if consecutive_failures >= max_failures_before_reopen:
+                    logger.warning("[RTSP] Reopening stream after repeated failures")
+                    if not self._open_capture():
+                        logger.error("[RTSP] Stream reopen failed; waiting before next retry")
+                        time.sleep(3)
+                        continue
+                    consecutive_failures = 0
+                    # After reopen, try to re-prime frame2
+                    ok, frame2 = self.cap.read()
+                    if not ok:
+                        logger.error("[RTSP] Failed to grab frame immediately after reopen")
+                        time.sleep(1)
+                        continue
+                time.sleep(0.05)
+                continue
+            else:
+                consecutive_failures = 0
+
+            # Motion detection pipeline
             gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
             blurred2 = cv2.GaussianBlur(gray2, (21, 21), 0)
             masked2 = cv2.bitwise_and(blurred2, blurred2, mask=self.timestamp_mask)
@@ -825,9 +968,7 @@ class RTSPMotionDetector:
             diff = cv2.absdiff(masked1, masked2)
             _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
             dilated = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(
-                dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             motion = False
             max_area = 0
@@ -850,8 +991,15 @@ class RTSPMotionDetector:
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
                     filepath = os.path.join(self.save_folder, filename)
-                    cv2.imwrite(filepath, frame2)
-                    logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
+                    try:
+                        cv2.imwrite(filepath, frame2)
+                        logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
+                    except Exception as e:
+                        logger.error(f"[RTSP] Failed to write image {filepath}: {e}")
+                        # Continue loop; don't break pipeline
+                        masked1 = masked2
+                        time.sleep(0.01)
+                        continue
 
                     if armed:
                         self.hardware.activate_alarm(True)
@@ -862,9 +1010,7 @@ class RTSPMotionDetector:
                     if uploaded:
                         metadata = {
                             "location": Config.LOCATION_CODE,
-                            "reason": "motion_detected"
-                            if armed
-                            else "motion_detected_disarmed",
+                            "reason": "motion_detected" if armed else "motion_detected_disarmed",
                             "area": max_area,
                             "local_file": filepath,
                             "sftp_path": sftp_dst,
@@ -875,22 +1021,18 @@ class RTSPMotionDetector:
                         }
                         self.mqtt_client.publish_image_alert(sftp_dst, metadata)
                     else:
-                        logger.error(f"Failed to upload {filepath}")
+                        logger.error(f"[RTSP] Upload failed for {filepath}")
 
                     last_capture = time.time()
             else:
+                # Auto clear alarm relay after ALARM_DURATION
                 armed, relay_state = self.alarm_store.get()
                 if relay_state and armed and (time.time() - last_capture > Config.ALARM_DURATION):
                     self.hardware.activate_alarm(False)
                     self.alarm_store.set(relay_state=False)
 
             masked1 = masked2
-            ret, frame2 = cap.read()
-            if not ret:
-                logger.error("Failed to grab RTSP frame")
-                break
             time.sleep(0.01)
-        cap.release()
 
 
 # ===== Main App =====
@@ -973,9 +1115,11 @@ class SecureVoltApp:
 
     def publish_status_snapshot(self):
         payload = self.build_status_snapshot()
-        # ONLY publisher to sim7600/status
-        self.mqtt_client.publish(Config.MQTT_TOPICS["status"], json.dumps(payload), qos=1)
-        logger.info(f"[STATUS] published → {Config.MQTT_TOPICS['status']}")
+        try:
+            self.mqtt_client.publish(Config.MQTT_TOPICS["status"], json.dumps(payload), qos=1)
+            logger.info(f"[STATUS] published → {Config.MQTT_TOPICS['status']}")
+        except Exception as e:
+            logger.warning(f"[STATUS] publish failed: {e}")
 
     def run(self):
         if not self.mqtt.connect():

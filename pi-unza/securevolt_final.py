@@ -315,9 +315,7 @@ class EnvironmentalSensor:
                 "status": "OK",
             }
         except Exception as e:
-            return {
-                "status": f"Error: {str(e)}",
-            }
+            return {"status": f"Error: {str(e)}"}
 
 
 # ===== Hardware Controller =====
