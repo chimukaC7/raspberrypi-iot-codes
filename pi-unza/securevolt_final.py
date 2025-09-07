@@ -806,6 +806,11 @@ class SecureVoltMQTT:
 
 # ===== RTSP Motion Detector (includes upload + MQTT image alert) =====
 class RTSPMotionDetector:
+    FROZEN_HASH_REPEAT_MAX = 60         # ~60 iterations of identical frames → reopen
+    STALE_FRAME_TIMEOUT_SEC = 12        # no *changed* frame for this long → reopen
+    FORCE_REOPEN_EVERY_SEC = 15 * 60    # periodic safety reopen
+    READ_FAILS_BEFORE_REOPEN = 5
+
     def __init__(
         self,
         rtsp_url: str,
@@ -826,21 +831,45 @@ class RTSPMotionDetector:
         self.hardware = hardware
         self.alarm_store = alarm_store
         os.makedirs(self.save_folder, exist_ok=True)
-        self.timestamp_mask = None
+
         self.cap = None
+        self.timestamp_mask = None
+
+        # Watchdogs
+        self._last_frame_hash = None
+        self._same_hash_count = 0
+        self._last_change_ts = time.time()
+        self._last_forced_reopen = 0.0
+
+    # ---- small helpers ----
+    @staticmethod
+    def _quick_hash(frame: np.ndarray) -> int:
+        """Cheap perceptual-ish hash: resize → grayscale → bytes → hash()."""
+        try:
+            small = cv2.resize(frame, (32, 32))   # tiny + fast
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            # Using Python's hash on bytes is enough to detect 'no change'
+            return hash(gray.tobytes())
+        except Exception:
+            return 0
 
     def _cleanup_old_files(self):
         cutoff = time.time() - Config.MAX_STORAGE_HOURS * 3600
         for fn in os.listdir(self.save_folder):
             p = os.path.join(self.save_folder, fn)
-            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
-                try:
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
                     os.remove(p)
                     logger.info(f"Removed old file: {fn}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove {fn}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to remove {fn}: {e}")
 
     def _init_timestamp_mask(self, frame):
+        # same as yours, but guard against empty frames
+        if frame is None or frame.size == 0:
+            self.timestamp_mask = None
+            return
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (21, 21), 0)
         h, w = blurred.shape
@@ -861,9 +890,9 @@ class RTSPMotionDetector:
             ignore_y_start = 0
             ignore_y_end = 60
 
-        timestamp_mask = np.ones_like(gray, dtype=np.uint8) * 255
-        timestamp_mask[ignore_y_start:ignore_y_end, ignore_x_start:ignore_x_end] = 0
-        self.timestamp_mask = timestamp_mask
+        mask = np.ones_like(gray, dtype=np.uint8) * 255
+        mask[ignore_y_start:ignore_y_end, ignore_x_start:ignore_x_end] = 0
+        self.timestamp_mask = mask
 
     def _open_capture(self, attempts: int = 6, base_delay: float = 1.0) -> bool:
         if self.cap is not None:
@@ -877,12 +906,22 @@ class RTSPMotionDetector:
         for i in range(1, attempts + 1):
             try:
                 logger.info(f"[RTSP] Opening stream (attempt {i}/{attempts}) → {self.rtsp_url}")
-                # Prefer FFmpeg backend for RTSP
                 cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-                # A quick sanity check
-                ok, _ = cap.read()
-                if ok:
+
+                # Aggressive buffering control (keeps frames fresh)
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size > 0:
                     self.cap = cap
+                    self._same_hash_count = 0
+                    self._last_frame_hash = None
+                    self._last_change_ts = time.time()
+                    self._last_forced_reopen = time.time()
+                    self._init_timestamp_mask(frame)
                     logger.info("[RTSP] Stream opened successfully")
                     return True
                 else:
@@ -891,8 +930,23 @@ class RTSPMotionDetector:
                 logger.warning(f"[RTSP] Open attempt {i} failed: {e}")
             time.sleep(delay)
             delay = min(delay * 2, 8.0)
+
         logger.error("[RTSP] Failed to open stream after retries")
         return False
+
+    def _maybe_force_reopen(self):
+        now = time.time()
+
+        # Periodic forced reopen
+        if now - self._last_forced_reopen > self.FORCE_REOPEN_EVERY_SEC:
+            logger.info("[RTSP] Periodic forced reopen")
+            self._open_capture()
+            return
+
+        # Stale frame protection: no content change for too long
+        if now - self._last_change_ts > self.STALE_FRAME_TIMEOUT_SEC:
+            logger.warning("[RTSP] Stream appears stale (no change) → reopening")
+            self._open_capture()
 
     def run(self):
         logger.info(f"Starting RTSP motion detection on {self.rtsp_url}")
@@ -901,36 +955,10 @@ class RTSPMotionDetector:
             logger.error(f"Failed to connect to RTSP stream: {self.rtsp_url}")
             return
 
-        # Prime two frames; if fails, try to reopen
-        ok, frame1 = self.cap.read()
-        if not ok:
-            logger.warning("[RTSP] Failed to grab initial frame → reopening")
-            if not self._open_capture():
-                return
-            ok, frame1 = self.cap.read()
-            if not ok:
-                logger.error("[RTSP] Could not grab initial frame after reopen")
-                return
-
-        self._init_timestamp_mask(frame1)
-        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-        blurred1 = cv2.GaussianBlur(gray1, (21, 21), 0)
-        masked1 = cv2.bitwise_and(blurred1, blurred1, mask=self.timestamp_mask)
-
-        ok, frame2 = self.cap.read()
-        if not ok:
-            logger.warning("[RTSP] Failed to grab second frame → reopening")
-            if not self._open_capture():
-                return
-            ok, frame2 = self.cap.read()
-            if not ok:
-                logger.error("[RTSP] Could not grab second frame after reopen")
-                return
-
+        # Prime a second frame after open
+        read_failures = 0
         last_capture = 0.0
         last_cleanup = time.time()
-        consecutive_failures = 0
-        max_failures_before_reopen = 5
 
         while True:
             # Housekeeping
@@ -938,101 +966,143 @@ class RTSPMotionDetector:
                 self._cleanup_old_files()
                 last_cleanup = time.time()
 
-            # Read next frame with auto-reopen on repeated failure
-            ok, frame2 = self.cap.read()
-            if not ok:
-                consecutive_failures += 1
-                logger.warning(f"[RTSP] Failed to grab frame ({consecutive_failures}/{max_failures_before_reopen})")
-                if consecutive_failures >= max_failures_before_reopen:
+            # Safety: bail if cap missing
+            if self.cap is None:
+                logger.warning("[RTSP] cap is None → reopen")
+                if not self._open_capture():
+                    time.sleep(2)
+                    continue
+
+            # Read a frame (guard for black/empty)
+            ok, frame = (False, None)
+            try:
+                ok, frame = self.cap.read()
+            except Exception as e:
+                ok, frame = False, None
+                logger.warning(f"[RTSP] read() threw: {e}")
+
+            if not ok or frame is None or frame.size == 0:
+                read_failures += 1
+                logger.warning(f"[RTSP] Failed to grab frame ({read_failures}/{self.READ_FAILS_BEFORE_REOPEN})")
+                if read_failures >= self.READ_FAILS_BEFORE_REOPEN:
                     logger.warning("[RTSP] Reopening stream after repeated failures")
                     if not self._open_capture():
-                        logger.error("[RTSP] Stream reopen failed; waiting before next retry")
+                        logger.error("[RTSP] Stream reopen failed; sleeping before next retry")
                         time.sleep(3)
-                        continue
-                    consecutive_failures = 0
-                    # After reopen, try to re-prime frame2
-                    ok, frame2 = self.cap.read()
-                    if not ok:
-                        logger.error("[RTSP] Failed to grab frame immediately after reopen")
-                        time.sleep(1)
-                        continue
-                time.sleep(0.05)
+                    read_failures = 0
+                else:
+                    time.sleep(0.05)
+                # On failure, attempt stale check too
+                self._maybe_force_reopen()
                 continue
             else:
-                consecutive_failures = 0
+                read_failures = 0
 
-            # Motion detection pipeline
-            gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
-            blurred2 = cv2.GaussianBlur(gray2, (21, 21), 0)
-            masked2 = cv2.bitwise_and(blurred2, blurred2, mask=self.timestamp_mask)
-
-            diff = cv2.absdiff(masked1, masked2)
-            _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-            dilated = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            motion = False
-            max_area = 0
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < self.min_contour_area:
-                    continue
-                x, y, w, h = cv2.boundingRect(cnt)
-                cv2.rectangle(frame2, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                motion = True
-                max_area = max(max_area, area)
-
-            if motion and (time.time() - last_capture > self.motion_cooldown):
-                armed, relay_state = self.alarm_store.get()
-                should_capture = True if Config.CAPTURE_WHEN_DISARMED else armed
-
-                if not should_capture:
-                    logger.info("[RTSP] Motion detected but system is DISARMED and capture disabled; skipping.")
-                else:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
-                    filepath = os.path.join(self.save_folder, filename)
-                    try:
-                        cv2.imwrite(filepath, frame2)
-                        logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
-                    except Exception as e:
-                        logger.error(f"[RTSP] Failed to write image {filepath}: {e}")
-                        # Continue loop; don't break pipeline
-                        masked1 = masked2
-                        time.sleep(0.01)
-                        continue
-
-                    if armed:
-                        self.hardware.activate_alarm(True)
-                        self.alarm_store.set(relay_state=True)
-
-                    sftp_dst = os.path.join(Config.SFTP_UPLOAD_PATH, filename)
-                    uploaded = self.uploader.upload_image(filepath, sftp_dst)
-                    if uploaded:
-                        metadata = {
-                            "location": Config.LOCATION_CODE,
-                            "reason": "motion_detected" if armed else "motion_detected_disarmed",
-                            "area": max_area,
-                            "local_file": filepath,
-                            "sftp_path": sftp_dst,
-                            "device_serial": Config.DEVICE_SERIAL,
-                            "ip_address": Config.IP_ADDRESS,
-                            "armed": armed,
-                            "relay_state": relay_state,
-                        }
-                        self.mqtt_client.publish_image_alert(sftp_dst, metadata)
-                    else:
-                        logger.error(f"[RTSP] Upload failed for {filepath}")
-
-                    last_capture = time.time()
+            # Frozen-frame detection
+            h = self._quick_hash(frame)
+            if h == self._last_frame_hash:
+                self._same_hash_count += 1
             else:
+                self._same_hash_count = 0
+                self._last_change_ts = time.time()
+                self._last_frame_hash = h
+
+            if self._same_hash_count >= self.FROZEN_HASH_REPEAT_MAX:
+                logger.warning("[RTSP] Frozen frame detected → reopening stream")
+                self._open_capture()
+                self._same_hash_count = 0
+                time.sleep(0.1)
+                continue
+
+            # Motion detection pipeline (masked diff)
+            try:
+                # (Re)create mask if missing (e.g., after reopen)
+                if self.timestamp_mask is None:
+                    self._init_timestamp_mask(frame)
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+                masked = cv2.bitwise_and(blurred, blurred, mask=self.timestamp_mask)
+
+                # Use previous masked frame from short rolling memory
+                if not hasattr(self, "_prev_masked") or self._prev_masked is None:
+                    self._prev_masked = masked
+                    time.sleep(0.01)
+                    self._maybe_force_reopen()
+                    continue
+
+                diff = cv2.absdiff(self._prev_masked, masked)
+                _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+                dilated = cv2.dilate(thresh, None, iterations=2)
+                contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                motion = False
+                max_area = 0
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < self.min_contour_area:
+                        continue
+                    motion = True
+                    max_area = max(max_area, area)
+
+                if motion and (time.time() - last_capture > self.motion_cooldown):
+                    armed, relay_state = self.alarm_store.get()
+                    should_capture = True if Config.CAPTURE_WHEN_DISARMED else armed
+
+                    if should_capture:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"{Config.LOCATION_CODE}_{Config.DEVICE_SERIAL}_{ts}.jpg"
+                        filepath = os.path.join(self.save_folder, filename)
+                        try:
+                            cv2.imwrite(filepath, frame)
+                            logger.info(f"[RTSP] Motion detected! Saved: {filepath}")
+                        except Exception as e:
+                            logger.error(f"[RTSP] Failed to write image {filepath}: {e}")
+                            self._prev_masked = masked
+                            time.sleep(0.01)
+                            self._maybe_force_reopen()
+                            continue
+
+                        if armed:
+                            self.hardware.activate_alarm(True)
+                            self.alarm_store.set(relay_state=True)
+
+                        sftp_dst = os.path.join(Config.SFTP_UPLOAD_PATH, filename)
+                        uploaded = self.uploader.upload_image(filepath, sftp_dst)
+                        if uploaded:
+                            metadata = {
+                                "location": Config.LOCATION_CODE,
+                                "reason": "motion_detected" if armed else "motion_detected_disarmed",
+                                "area": max_area,
+                                "local_file": filepath,
+                                "sftp_path": sftp_dst,
+                                "device_serial": Config.DEVICE_SERIAL,
+                                "ip_address": Config.IP_ADDRESS,
+                                "armed": armed,
+                                "relay_state": relay_state,
+                            }
+                            self.mqtt_client.publish_image_alert(sftp_dst, metadata)
+                        else:
+                            logger.error(f"[RTSP] Upload failed for {filepath}")
+
+                        last_capture = time.time()
+                    else:
+                        logger.info("[RTSP] Motion but disarmed & capture disabled; skipping")
+
                 # Auto clear alarm relay after ALARM_DURATION
                 armed, relay_state = self.alarm_store.get()
                 if relay_state and armed and (time.time() - last_capture > Config.ALARM_DURATION):
                     self.hardware.activate_alarm(False)
                     self.alarm_store.set(relay_state=False)
 
-            masked1 = masked2
+                self._prev_masked = masked
+
+            except Exception as e:
+                logger.error(f"[RTSP] Motion pipeline error: {e}")
+
+            # Reopen checks that don’t depend on errors
+            self._maybe_force_reopen()
+
             time.sleep(0.01)
 
 
