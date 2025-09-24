@@ -42,7 +42,7 @@ except ImportError as e:
 import paho.mqtt.client as mqtt
 import paramiko
 import serial
-
+import random
 
 # ===== Utilities: Programmatic identifiers =====
 def _get_device_serial() -> str:
@@ -805,10 +805,26 @@ class SecureVoltMQTT:
 
 # ===== RTSP Motion Detector (includes upload + MQTT image alert) =====
 class RTSPMotionDetector:
-    FROZEN_HASH_REPEAT_MAX = 60         # ~60 iterations of identical frames → reopen
-    STALE_FRAME_TIMEOUT_SEC = 12        # no *changed* frame for this long → reopen
-    FORCE_REOPEN_EVERY_SEC = 15 * 60    # periodic safety reopen
+    """
+    Hardened RTSP reader with:
+      - Black/frozen frame watchdogs
+      - Resolution-change handling (resets masks/cache)
+      - Jittered backoff + periodic forced reopen
+      - grab()/retrieve() pattern to keep frames fresh post-reconnect
+      - Defensive masking & motion gating
+    """
+
+    # Tunables (kept conservative; tweak if needed)
+    FROZEN_HASH_REPEAT_MAX = 90          # ~90 identical frames → reopen
+    STALE_FRAME_TIMEOUT_SEC = 12         # no content change for this long → reopen
+    FORCE_REOPEN_MIN_SEC = 13 * 60       # jittered periodic reopen window (min)
+    FORCE_REOPEN_MAX_SEC = 17 * 60       # jittered periodic reopen window (max)
     READ_FAILS_BEFORE_REOPEN = 5
+    DUPLICATE_FRAME_MAX = 120            # duplicate content counter threshold
+    BLACK_FRAME_MAX = 45                 # consecutive black frames → reopen
+    MAX_GRAB_BURST = 3                   # after open, burst-grab a few to clear buffers
+    MIN_MOTION_FRACTION = 0.002          # at least 0.2% of pixels must move
+    MAX_MASKED_RATIO = 0.40              # safety cap if mask accidentally too large
 
     def __init__(
         self,
@@ -833,24 +849,51 @@ class RTSPMotionDetector:
 
         self.cap = None
         self.timestamp_mask = None
+        self._prev_masked = None
 
-        # Watchdogs
+        # Watchdogs / state
         self._last_frame_hash = None
         self._same_hash_count = 0
+        self._duplicate_frame_count = 0
+        self._black_frame_count = 0
         self._last_change_ts = time.time()
         self._last_forced_reopen = 0.0
+        self._next_forced_reopen = 0.0
+        self._last_shape = None
+        self._stopping = False
 
-    # ---- small helpers ----
+    # ---- lifecycle ----
+    def stop(self):
+        self._stopping = True
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+        self.cap = None
+
+    # ---- helpers ----
     @staticmethod
     def _quick_hash(frame: np.ndarray) -> int:
-        """Cheap perceptual-ish hash: resize → grayscale → bytes → hash()."""
         try:
-            small = cv2.resize(frame, (32, 32))   # tiny + fast
+            small = cv2.resize(frame, (32, 32))
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            # Using Python's hash on bytes is enough to detect 'no change'
             return hash(gray.tobytes())
         except Exception:
             return 0
+
+    @staticmethod
+    def _is_black_like(frame: np.ndarray) -> bool:
+        # Heuristic: very low mean and std → likely black/frozen noise
+        try:
+            if frame is None or frame.size == 0:
+                return True
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            m = float(gray.mean())
+            s = float(gray.std())
+            return (m < 2.5 and s < 2.0)
+        except Exception:
+            return False
 
     def _cleanup_old_files(self):
         cutoff = time.time() - Config.MAX_STORAGE_HOURS * 3600
@@ -864,7 +907,6 @@ class RTSPMotionDetector:
                 logger.warning(f"Failed to remove {fn}: {e}")
 
     def _init_timestamp_mask(self, frame):
-        # same as yours, but guard against empty frames
         if frame is None or frame.size == 0:
             self.timestamp_mask = None
             return
@@ -879,21 +921,31 @@ class RTSPMotionDetector:
         if contours:
             largest = max(contours, key=cv2.contourArea)
             x, y, tw, th = cv2.boundingRect(largest)
-            ignore_x_start = x
-            ignore_x_end = x + tw
-            ignore_y_start = y
-            ignore_y_end = y + th
+            xs, xe = x, x + tw
+            ys, ye = y, y + th
         else:
-            ignore_x_start = 0
-            ignore_x_end = 250
-            ignore_y_start = 0
-            ignore_y_end = 60
+            xs, xe, ys, ye = 0, min(250, w), 0, min(60, h)
 
         mask = np.ones_like(gray, dtype=np.uint8) * 255
-        mask[ignore_y_start:ignore_y_end, ignore_x_start:ignore_x_end] = 0
+        mask[ys:ye, xs:xe] = 0
+
+        # Safety: ensure we didn't mask too much (bad threshold could blank screen)
+        masked_ratio = 1.0 - (float(mask.sum()) / (255.0 * mask.size))
+        if masked_ratio > self.MAX_MASKED_RATIO:
+            logger.warning(f"[RTSP] Timestamp mask too big ({masked_ratio:.2%}) → clamping")
+            mask = np.ones_like(gray, dtype=np.uint8) * 255
+            mask[0 : int(h * 0.12), 0 : int(w * 0.35)] = 0  # conservative default
+
         self.timestamp_mask = mask
 
+    def _schedule_next_forced_reopen(self):
+        self._last_forced_reopen = time.time()
+        # Jittered window to avoid synchronized reopen storms
+        jitter = random.uniform(self.FORCE_REOPEN_MIN_SEC, self.FORCE_REOPEN_MAX_SEC)
+        self._next_forced_reopen = self._last_forced_reopen + jitter
+
     def _open_capture(self, attempts: int = 6, base_delay: float = 1.0) -> bool:
+        # Release old
         if self.cap is not None:
             try:
                 self.cap.release()
@@ -903,31 +955,52 @@ class RTSPMotionDetector:
 
         delay = base_delay
         for i in range(1, attempts + 1):
+            if self._stopping:
+                return False
             try:
                 logger.info(f"[RTSP] Opening stream (attempt {i}/{attempts}) → {self.rtsp_url}")
                 cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-                # Aggressive buffering control (keeps frames fresh)
                 try:
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:
                     pass
 
-                ok, frame = cap.read()
+                # Burst grab a few frames to clear internal buffers after connect
+                grabbed_ok = False
+                for _ in range(self.MAX_GRAB_BURST):
+                    if not cap.grab():
+                        time.sleep(0.05)
+                    else:
+                        grabbed_ok = True
+                        break
+
+                ok, frame = cap.retrieve() if grabbed_ok else cap.read()
                 if ok and frame is not None and frame.size > 0:
+                    if self._is_black_like(frame):
+                        logger.warning("[RTSP] First frame looks black → retry open")
+                        cap.release()
+                        raise RuntimeError("Black first frame")
+
                     self.cap = cap
                     self._same_hash_count = 0
+                    self._duplicate_frame_count = 0
+                    self._black_frame_count = 0
                     self._last_frame_hash = None
                     self._last_change_ts = time.time()
-                    self._last_forced_reopen = time.time()
+                    self._prev_masked = None
+                    self._last_shape = frame.shape[:2]  # (h, w)
+
                     self._init_timestamp_mask(frame)
+                    self._schedule_next_forced_reopen()
                     logger.info("[RTSP] Stream opened successfully")
                     return True
                 else:
                     cap.release()
             except Exception as e:
                 logger.warning(f"[RTSP] Open attempt {i} failed: {e}")
-            time.sleep(delay)
+
+            time.sleep(delay + random.uniform(0, 0.25))  # tiny jitter
             delay = min(delay * 2, 8.0)
 
         logger.error("[RTSP] Failed to open stream after retries")
@@ -936,9 +1009,9 @@ class RTSPMotionDetector:
     def _maybe_force_reopen(self):
         now = time.time()
 
-        # Periodic forced reopen
-        if now - self._last_forced_reopen > self.FORCE_REOPEN_EVERY_SEC:
-            logger.info("[RTSP] Periodic forced reopen")
+        # Jittered periodic forced reopen
+        if now >= self._next_forced_reopen:
+            logger.info("[RTSP] Periodic forced reopen (jittered)")
             self._open_capture()
             return
 
@@ -954,12 +1027,11 @@ class RTSPMotionDetector:
             logger.error(f"Failed to connect to RTSP stream: {self.rtsp_url}")
             return
 
-        # Prime a second frame after open
         read_failures = 0
         last_capture = 0.0
         last_cleanup = time.time()
 
-        while True:
+        while not self._stopping:
             # Housekeeping
             if time.time() - last_cleanup > 1800:
                 self._cleanup_old_files()
@@ -972,13 +1044,16 @@ class RTSPMotionDetector:
                     time.sleep(2)
                     continue
 
-            # Read a frame (guard for black/empty)
+            # Fresh read: favor grab/retrieve to keep latency low
             ok, frame = (False, None)
             try:
-                ok, frame = self.cap.read()
+                if self.cap.grab():
+                    ok, frame = self.cap.retrieve()
+                else:
+                    ok, frame = False, None
             except Exception as e:
                 ok, frame = False, None
-                logger.warning(f"[RTSP] read() threw: {e}")
+                logger.warning(f"[RTSP] retrieve() threw: {e}")
 
             if not ok or frame is None or frame.size == 0:
                 read_failures += 1
@@ -991,31 +1066,53 @@ class RTSPMotionDetector:
                     read_failures = 0
                 else:
                     time.sleep(0.05)
-                # On failure, attempt stale check too
                 self._maybe_force_reopen()
                 continue
             else:
                 read_failures = 0
 
-            # Frozen-frame detection
-            h = self._quick_hash(frame)
-            if h == self._last_frame_hash:
+            # Resolution change handling (camera profile changed / VBR mode swap)
+            h, w = frame.shape[:2]
+            if self._last_shape and (h, w) != self._last_shape:
+                logger.info(f"[RTSP] Resolution changed {self._last_shape} → {(h, w)}; resetting masks")
+                self._last_shape = (h, w)
+                self._prev_masked = None
+                self._init_timestamp_mask(frame)
+
+            # Black-frame watchdog
+            if self._is_black_like(frame):
+                self._black_frame_count += 1
+                if self._black_frame_count >= self.BLACK_FRAME_MAX:
+                    logger.warning("[RTSP] Black frames persisting → reopening")
+                    self._open_capture()
+                    self._black_frame_count = 0
+                    time.sleep(0.1)
+                    continue
+            else:
+                self._black_frame_count = 0
+
+            # Frozen/duplicate-frame detection
+            hsh = self._quick_hash(frame)
+            if hsh == self._last_frame_hash:
                 self._same_hash_count += 1
+                self._duplicate_frame_count += 1
             else:
                 self._same_hash_count = 0
+                self._duplicate_frame_count = 0
                 self._last_change_ts = time.time()
-                self._last_frame_hash = h
+                self._last_frame_hash = hsh
 
-            if self._same_hash_count >= self.FROZEN_HASH_REPEAT_MAX:
-                logger.warning("[RTSP] Frozen frame detected → reopening stream")
+            if self._same_hash_count >= self.FROZEN_HASH_REPEAT_MAX or \
+               self._duplicate_frame_count >= self.DUPLICATE_FRAME_MAX:
+                logger.warning("[RTSP] Frozen/duplicate frames detected → reopening stream")
                 self._open_capture()
                 self._same_hash_count = 0
+                self._duplicate_frame_count = 0
                 time.sleep(0.1)
                 continue
 
-            # Motion detection pipeline (masked diff)
+            # Motion detection (masked diff)
             try:
-                # (Re)create mask if missing (e.g., after reopen)
                 if self.timestamp_mask is None:
                     self._init_timestamp_mask(frame)
 
@@ -1023,11 +1120,10 @@ class RTSPMotionDetector:
                 blurred = cv2.GaussianBlur(gray, (21, 21), 0)
                 masked = cv2.bitwise_and(blurred, blurred, mask=self.timestamp_mask)
 
-                # Use previous masked frame from short rolling memory
-                if not hasattr(self, "_prev_masked") or self._prev_masked is None:
+                if self._prev_masked is None:
                     self._prev_masked = masked
-                    time.sleep(0.01)
                     self._maybe_force_reopen()
+                    time.sleep(0.01)
                     continue
 
                 diff = cv2.absdiff(self._prev_masked, masked)
@@ -1044,6 +1140,12 @@ class RTSPMotionDetector:
                     motion = True
                     max_area = max(max_area, area)
 
+                # Additional gating: ensure motion covers meaningful fraction of frame
+                if motion:
+                    motion_fraction = max_area / float(h * w)
+                    if motion_fraction < self.MIN_MOTION_FRACTION:
+                        motion = False
+
                 if motion and (time.time() - last_capture > self.motion_cooldown):
                     armed, relay_state = self.alarm_store.get()
                     should_capture = True if Config.CAPTURE_WHEN_DISARMED else armed
@@ -1058,8 +1160,8 @@ class RTSPMotionDetector:
                         except Exception as e:
                             logger.error(f"[RTSP] Failed to write image {filepath}: {e}")
                             self._prev_masked = masked
-                            time.sleep(0.01)
                             self._maybe_force_reopen()
+                            time.sleep(0.01)
                             continue
 
                         if armed:
@@ -1102,7 +1204,9 @@ class RTSPMotionDetector:
             # Reopen checks that don’t depend on errors
             self._maybe_force_reopen()
 
-            time.sleep(0.01)
+            # Small yield to reduce CPU without latency penalty
+            time.sleep(0.05)
+
 
 
 # ===== Main App =====
